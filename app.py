@@ -1,0 +1,622 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import os
+import re
+from datetime import date, datetime
+from decimal import Decimal
+from functools import lru_cache
+
+import pyodbc
+from flask import Flask, jsonify, request, send_from_directory
+
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+CONN_STR = (
+    "DRIVER={ODBC Driver 17 for SQL Server};"
+    "SERVER=prdsql;"
+    "DATABASE=mag_pbi;"
+    "Trusted_Connection=yes;"
+    "TrustServerCertificate=yes;"
+)
+
+app = Flask(__name__, static_folder="static", static_url_path="/static")
+
+
+def connect():
+    conn = pyodbc.connect(CONN_STR, timeout=20)
+    conn.timeout = 90
+    return conn
+
+
+def sql_scalar(cur, query, params=()):
+    cur.execute(query, params)
+    row = cur.fetchone()
+    return None if row is None else row[0]
+
+
+def rows_dicts(cur):
+    cols = [c[0] for c in cur.description]
+    out = []
+    for row in cur.fetchall():
+        item = {}
+        for col, val in zip(cols, row):
+            if isinstance(val, Decimal):
+                val = float(val)
+            elif isinstance(val, (datetime, date)):
+                val = val.isoformat()
+            elif isinstance(val, bytes):
+                val = None
+            item[col] = val
+        out.append(item)
+    return out
+
+
+def num(v):
+    if v is None:
+        return 0.0
+    return float(v)
+
+
+def ratio(nume, deno):
+    deno = num(deno)
+    if deno == 0:
+        return None
+    return round(num(nume) / deno * 100.0, 1)
+
+
+def unit_price(nume, deno):
+    deno = num(deno)
+    if deno == 0:
+        return None
+    return round(num(nume) / deno, 2)
+
+
+def sum_money(vals):
+    found = [num(v) for v in vals if v is not None]
+    if not found:
+        return None
+    return round(sum(found), 2)
+
+
+def parse_date(name, default=None):
+    raw = (request.args.get(name) or "").strip()
+    if not raw:
+        return default
+    return datetime.strptime(raw, "%Y-%m-%d").date()
+
+
+def q_text(name):
+    v = (request.args.get(name) or "").strip()
+    return v or None
+
+
+def _uniq(values):
+    seen = set()
+    out = []
+    for raw in values:
+        v = str(raw).strip()
+        if not v:
+            continue
+        key = v.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
+def split_list(raw):
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        parts = []
+        for item in raw:
+            parts.extend(re.split(r"[\n,;\t]+", str(item)))
+        return _uniq(parts)
+    return _uniq(re.split(r"[\n,;\t]+", str(raw)))
+
+
+def req_val(name, default=None):
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        if name in body and body[name] not in (None, ""):
+            return body[name]
+    return request.args.get(name, default)
+
+
+def req_list(name):
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        if name in body:
+            return split_list(body.get(name))
+    vals = request.args.getlist(name)
+    if not vals:
+        return []
+    return split_list(vals)
+
+
+def add_str_filter(expr, values, extra, extra_params, exact=False):
+    values = _uniq(values)
+    if not values:
+        return
+    if exact or len(values) > 1:
+        ph = ",".join("?" * len(values))
+        extra.append(f"{expr} IN ({ph})")
+        extra_params.extend(values)
+    else:
+        extra.append(f"{expr} LIKE ?")
+        extra_params.append(f"%{values[0]}%")
+
+
+@lru_cache(maxsize=1)
+def date_bounds():
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT MIN(report_date), MAX(report_date) FROM ext_belousov.ozon_perfomance"
+        )
+        mn, mx = cur.fetchone()
+        return mn, mx
+
+
+@app.get("/")
+def index():
+    return send_from_directory(APP_DIR, "static/index.html")
+
+
+@app.get("/api/meta")
+def api_meta():
+    mn, mx = date_bounds()
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT LTRIM(RTRIM(g.g)) AS g
+            FROM pbi.groups g
+            WHERE NULLIF(LTRIM(RTRIM(g.g)), '') IS NOT NULL
+              AND g.g NOT LIKE N'%*%'
+            ORDER BY 1
+            """
+        )
+        groups1 = [r[0] for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT DISTINCT LTRIM(RTRIM(n.[Менеджер OZON])) AS mgr
+            FROM pbi.nomenclature AS n
+            WHERE NULLIF(LTRIM(RTRIM(n.[Менеджер OZON])), N'') IS NOT NULL
+            ORDER BY 1
+            """
+        )
+        managers = [r[0] for r in cur.fetchall()]
+    managers = ["Без менеджера", *managers]
+    return jsonify(
+        {
+            "min_date": mn.isoformat() if mn else None,
+            "max_date": mx.isoformat() if mx else None,
+            "groups1": groups1,
+            "managers": managers,
+        }
+    )
+
+
+def _args_list(name):
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        if name in body:
+            return split_list(body.get(name))
+    return split_list(request.args.getlist(name) or request.args.get(name))
+
+
+@app.get("/api/groups")
+@app.post("/api/groups")
+def api_groups():
+    gs = _args_list("g")
+    g1s = _args_list("g1")
+    if not gs:
+        return jsonify([])
+    with connect() as conn:
+        cur = conn.cursor()
+        g_ph = ",".join("?" * len(gs))
+        if not g1s:
+            cur.execute(
+                f"""
+                SELECT DISTINCT LTRIM(RTRIM(g1)) AS val
+                FROM pbi.groups
+                WHERE LTRIM(RTRIM(g)) IN ({g_ph})
+                  AND NULLIF(LTRIM(RTRIM(g1)), '') IS NOT NULL
+                  AND g NOT LIKE N'%*%'
+                ORDER BY 1
+                """,
+                gs,
+            )
+        else:
+            g1_ph = ",".join("?" * len(g1s))
+            cur.execute(
+                f"""
+                SELECT DISTINCT LTRIM(RTRIM(g2)) AS val
+                FROM pbi.groups
+                WHERE LTRIM(RTRIM(g)) IN ({g_ph})
+                  AND LTRIM(RTRIM(g1)) IN ({g1_ph})
+                  AND NULLIF(LTRIM(RTRIM(g2)), '') IS NOT NULL
+                  AND g NOT LIKE N'%*%'
+                ORDER BY 1
+                """,
+                [*gs, *g1s],
+            )
+        return jsonify([r[0] for r in cur.fetchall()])
+
+
+@app.get("/api/products")
+@app.post("/api/products")
+def api_products():
+    mn, mx = date_bounds()
+    raw_from = req_val("from")
+    raw_to = req_val("to")
+    date_from = (
+        datetime.strptime(str(raw_from), "%Y-%m-%d").date() if raw_from else mx
+    )
+    date_to = datetime.strptime(str(raw_to), "%Y-%m-%d").date() if raw_to else mx
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+
+    groups1 = req_list("g")
+    groups2 = req_list("g1")
+    groups3 = req_list("g2")
+    managers = req_list("manager")
+    artic = req_list("artic")
+    code = req_list("code")
+    nom = req_list("nom")
+    skus = req_list("sku")
+    campaign_ids = req_list("campaign_id")
+    body = request.get_json(silent=True) or {}
+    artic_exact = True
+    code_exact = True
+    nom_exact = True
+    if request.is_json and "statuses" in body:
+        statuses = split_list(body.get("statuses"))
+    elif request.args.getlist("statuses"):
+        statuses = req_list("statuses")
+    else:
+        statuses = ["Активна", "Запланирована", "Приостановлена"]
+    status_set = {s.strip() for s in statuses if str(s).strip()}
+
+    extra = []
+    extra_params: list = []
+    add_str_filter("LTRIM(RTRIM(gr.g))", groups1, extra, extra_params, exact=True)
+    add_str_filter("LTRIM(RTRIM(gr.g1))", groups2, extra, extra_params, exact=True)
+    add_str_filter("LTRIM(RTRIM(gr.g2))", groups3, extra, extra_params, exact=True)
+    named_managers = [m for m in managers if m != "Без менеджера"]
+    want_empty_mgr = "Без менеджера" in managers
+    if want_empty_mgr and named_managers:
+        ph = ",".join("?" * len(named_managers))
+        extra.append(
+            f"(NULLIF(LTRIM(RTRIM(n.manager)), N'') IS NULL OR LTRIM(RTRIM(n.manager)) IN ({ph}))"
+        )
+        extra_params.extend(named_managers)
+    elif want_empty_mgr:
+        extra.append("NULLIF(LTRIM(RTRIM(n.manager)), N'') IS NULL")
+    else:
+        add_str_filter("LTRIM(RTRIM(n.manager))", named_managers, extra, extra_params, exact=True)
+    add_str_filter("n.artic", artic, extra, extra_params, exact=artic_exact)
+    add_str_filter("n.code", code, extra, extra_params, exact=code_exact)
+    add_str_filter(
+        "COALESCE(n.description, a.nom_tbl, a.product_name)",
+        nom,
+        extra,
+        extra_params,
+        exact=nom_exact,
+    )
+    add_str_filter("a.sku", skus, extra, extra_params, exact=True)
+    add_str_filter("a.campaign_id", campaign_ids, extra, extra_params, exact=True)
+
+    extra_sql = (" AND " + " AND ".join(extra)) if extra else ""
+    params: list = [date_from, date_to, *extra_params]
+
+    sql = f"""
+    WITH ads AS (
+        SELECT
+            LTRIM(RTRIM(t.sku)) AS sku,
+            LTRIM(RTRIM(CAST(t.campaign_id AS nvarchar(64)))) AS campaign_id,
+            t.campaign_name,
+            t.status,
+            t.strategy,
+            t.placement,
+            t.report_date,
+            CAST(ISNULL(t.sales, 0) AS decimal(18, 2)) AS sales,
+            CAST(ISNULL(t.expense, 0) AS decimal(18, 2)) AS expense,
+            CAST(ISNULL(t.views, 0) AS bigint) AS views,
+            CAST(ISNULL(t.clicks, 0) AS bigint) AS clicks,
+            CAST(ISNULL(t.to_cart, 0) AS bigint) AS to_cart,
+            CAST(ISNULL(t.model_orders, 0) AS bigint) AS model_orders,
+            CAST(ISNULL(t.model_sales, 0) AS decimal(18, 2)) AS model_sales,
+            CAST(t.weekly_budget AS decimal(18, 2)) AS weekly_budget,
+            CAST(t.date_added AS date) AS date_added,
+            CAST(t.product_gmv AS decimal(18, 2)) AS product_gmv,
+            t.[Номенклатура] AS nom_tbl,
+            t.product_name
+        FROM ext_belousov.ozon_perfomance AS t
+        WHERE t.report_date >= ? AND t.report_date <= ?
+    ),
+    nom AS (
+        SELECT
+            LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64)))) AS sku,
+            MAX(n.description) AS description,
+            MAX(n.artic) AS artic,
+            MAX(LTRIM(RTRIM(n.code))) AS code,
+            MAX(n.photo) AS photo,
+            MAX(n.[1c_group]) AS [1c_group],
+            MAX(LTRIM(RTRIM(n.[Менеджер OZON]))) AS manager
+        FROM pbi.nomenclature AS n
+        WHERE NULLIF(LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64)))), N'') IS NOT NULL
+        GROUP BY LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64))))
+    ),
+    src AS (
+        SELECT
+            a.sku,
+            a.campaign_id,
+            a.campaign_name,
+            a.status,
+            a.strategy,
+            a.placement,
+            a.report_date,
+            a.sales,
+            a.expense,
+            a.views,
+            a.clicks,
+            a.to_cart,
+            a.model_orders,
+            a.model_sales,
+            a.weekly_budget,
+            a.date_added,
+            a.product_gmv,
+            COALESCE(n.description, a.nom_tbl, a.product_name) AS nom_name,
+            n.artic,
+            n.code,
+            n.photo,
+            n.manager
+        FROM ads AS a
+        LEFT JOIN nom AS n ON n.sku = a.sku
+        LEFT JOIN pbi.groups AS gr ON gr.[1c_id] = n.[1c_group]
+        WHERE 1 = 1{extra_sql}
+    ),
+    sku_gmv AS (
+        SELECT sku, SUM(day_gmv) AS gmv
+        FROM (
+            SELECT sku, report_date, MAX(product_gmv) AS day_gmv
+            FROM src
+            GROUP BY sku, report_date
+        ) d
+        GROUP BY sku
+    ),
+    sku_agg AS (
+        SELECT
+            sku,
+            MAX(nom_name) AS nom_name,
+            MAX(artic) AS artic,
+            MAX(code) AS code,
+            MAX(photo) AS photo,
+            SUM(sales) AS sales,
+            SUM(expense) AS expense,
+            SUM(views) AS views,
+            SUM(clicks) AS clicks
+        FROM src
+        GROUP BY sku
+    ),
+    camp_agg AS (
+        SELECT
+            sku,
+            campaign_id,
+            MAX(campaign_name) AS campaign_name,
+            SUM(sales) AS sales,
+            SUM(expense) AS expense,
+            SUM(views) AS views,
+            SUM(clicks) AS clicks,
+            SUM(to_cart) AS to_cart,
+            SUM(model_orders) AS model_orders,
+            SUM(model_sales) AS model_sales,
+            MAX(weekly_budget) AS budget,
+            MIN(date_added) AS date_added
+        FROM src
+        GROUP BY sku, campaign_id
+    ),
+    camp_status AS (
+        SELECT sku, campaign_id, status, strategy, placement
+        FROM (
+            SELECT
+                sku,
+                campaign_id,
+                status,
+                strategy,
+                placement,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sku, campaign_id
+                    ORDER BY
+                        CASE WHEN status IS NULL OR LTRIM(RTRIM(status)) = N'' THEN 1 ELSE 0 END,
+                        report_date DESC
+                ) AS rn
+            FROM src
+        ) x
+        WHERE rn = 1
+    )
+    SELECT
+        a.sku,
+        a.nom_name,
+        a.artic,
+        a.code,
+        a.photo,
+        a.sales,
+        a.expense,
+        a.views,
+        a.clicks,
+        g.gmv,
+        c.campaign_id,
+        c.campaign_name,
+        s.status,
+        s.strategy,
+        s.placement,
+        c.sales AS camp_sales,
+        c.expense AS camp_expense,
+        c.views AS camp_views,
+        c.clicks AS camp_clicks,
+        c.to_cart AS camp_to_cart,
+        c.model_orders AS camp_model_orders,
+        c.model_sales AS camp_model_sales,
+        c.budget AS camp_budget,
+        c.date_added AS camp_date_added
+    FROM sku_agg AS a
+    LEFT JOIN sku_gmv AS g ON g.sku = a.sku
+    INNER JOIN camp_agg AS c ON c.sku = a.sku
+    LEFT JOIN camp_status AS s
+        ON s.sku = c.sku AND s.campaign_id = c.campaign_id
+    ORDER BY a.expense DESC, a.sku, c.expense DESC;
+    """
+
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        raw = rows_dicts(cur)
+
+    products: dict[str, dict] = {}
+    order: list[str] = []
+    for row in raw:
+        sku = row["sku"]
+        if sku not in products:
+            sales = num(row["sales"])
+            expense = num(row["expense"])
+            gmv = None if row["gmv"] is None else round(num(row["gmv"]), 2)
+            products[sku] = {
+                "sku": sku,
+                "name": row["nom_name"] or sku,
+                "artic": row["artic"],
+                "code": row["code"],
+                "photo": row["photo"],
+                "sales": round(sales, 2),
+                "expense": round(expense, 2),
+                "views": int(num(row["views"])),
+                "clicks": int(num(row["clicks"])),
+                "drr": ratio(expense, sales),
+                "general_drr": ratio(expense, gmv),
+                "gmv": gmv,
+                "campaigns": {
+                    "active": [],
+                    "planned": [],
+                    "paused": [],
+                    "inactive": [],
+                    "done": [],
+                    "other": [],
+                },
+            }
+            order.append(sku)
+
+        if not row["campaign_id"]:
+            continue
+        camp_sales = num(row["camp_sales"])
+        camp_expense = num(row["camp_expense"])
+        camp_views = int(num(row["camp_views"]))
+        camp_clicks = int(num(row["camp_clicks"]))
+        camp_to_cart = int(num(row["camp_to_cart"]))
+        camp_budget = None if row["camp_budget"] is None else round(num(row["camp_budget"]), 2)
+        gmv = None if row["gmv"] is None else round(num(row["gmv"]), 2)
+        status = (row["status"] or "").strip()
+        if status not in status_set:
+            continue
+        camp = {
+            "id": row["campaign_id"],
+            "name": row["campaign_name"] or row["campaign_id"],
+            "status": status,
+            "strategy": (row.get("strategy") or "").strip() or None,
+            "placement": (row.get("placement") or "").strip() or None,
+            "sales": round(camp_sales, 2),
+            "expense": round(camp_expense, 2),
+            "views": camp_views,
+            "clicks": camp_clicks,
+            "to_cart": camp_to_cart,
+            "model_orders": int(num(row["camp_model_orders"])),
+            "model_sales": round(num(row["camp_model_sales"]), 2),
+            "budget": camp_budget,
+            "date_added": row["camp_date_added"],
+            "gmv": gmv,
+            "ctr": ratio(camp_clicks, camp_views),
+            "cpc": unit_price(camp_expense, camp_clicks),
+            "drr": ratio(camp_expense, camp_sales),
+            "general_drr": ratio(camp_expense, gmv),
+        }
+        if status == "Активна":
+            products[sku]["campaigns"]["active"].append(camp)
+        elif status == "Запланирована":
+            products[sku]["campaigns"]["planned"].append(camp)
+        elif status == "Приостановлена":
+            products[sku]["campaigns"]["paused"].append(camp)
+        elif status == "Неактивна":
+            products[sku]["campaigns"]["inactive"].append(camp)
+        elif status == "Завершена":
+            products[sku]["campaigns"]["done"].append(camp)
+        else:
+            products[sku]["campaigns"]["other"].append(camp)
+
+    items = []
+    for sku in order:
+        p = products[sku]
+        camps = (
+            p["campaigns"]["active"]
+            + p["campaigns"]["planned"]
+            + p["campaigns"]["paused"]
+            + p["campaigns"]["inactive"]
+            + p["campaigns"]["done"]
+            + p["campaigns"]["other"]
+        )
+        if not camps:
+            continue
+        p["sales"] = round(sum(c["sales"] for c in camps), 2)
+        p["expense"] = round(sum(c["expense"] for c in camps), 2)
+        p["views"] = sum(c["views"] for c in camps)
+        p["clicks"] = sum(c["clicks"] for c in camps)
+        p["to_cart"] = sum(c["to_cart"] for c in camps)
+        p["model_orders"] = sum(c["model_orders"] for c in camps)
+        p["model_sales"] = round(sum(c["model_sales"] for c in camps), 2)
+        p["budget"] = sum_money(c["budget"] for c in camps)
+        added = [c["date_added"] for c in camps if c.get("date_added")]
+        p["date_added"] = max(added) if added else None
+        p["drr"] = ratio(p["expense"], p["sales"])
+        p["general_drr"] = ratio(p["expense"], p.get("gmv"))
+        p["ctr"] = ratio(p["clicks"], p["views"])
+        p["cpc"] = unit_price(p["expense"], p["clicks"])
+        items.append(p)
+    tot_sales = sum(p["sales"] for p in items)
+    tot_exp = sum(p["expense"] for p in items)
+    tot_views = sum(p["views"] for p in items)
+    tot_clicks = sum(p["clicks"] for p in items)
+    tot_cart = sum(p["to_cart"] for p in items)
+    tot_model_orders = sum(p["model_orders"] for p in items)
+    tot_model_sales = round(sum(p["model_sales"] for p in items), 2)
+    tot_gmv = round(sum(num(p.get("gmv")) for p in items), 2)
+
+    return jsonify(
+        {
+            "from": date_from.isoformat() if date_from else None,
+            "to": date_to.isoformat() if date_to else None,
+            "count": len(items),
+            "totals": {
+                "sales": round(tot_sales, 2),
+                "expense": round(tot_exp, 2),
+                "views": tot_views,
+                "clicks": tot_clicks,
+                "to_cart": tot_cart,
+                "model_orders": tot_model_orders,
+                "model_sales": tot_model_sales,
+                "budget": sum_money(p.get("budget") for p in items),
+                "gmv": tot_gmv,
+                "date_added": None,
+                "drr": ratio(tot_exp, tot_sales),
+                "general_drr": ratio(tot_exp, tot_gmv),
+                "ctr": ratio(tot_clicks, tot_views),
+                "cpc": unit_price(tot_exp, tot_clicks),
+            },
+            "items": items,
+        }
+    )
+
+
+if __name__ == "__main__":
+    date_bounds.cache_clear()
+    app.run(host="127.0.0.1", port=8765, debug=False, threaded=True)
