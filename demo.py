@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from datetime import date
+from datetime import date, timedelta
+import math
 
 MIN_DATE = date(2026, 8, 1)
 MAX_DATE = date(2026, 8, 29)
@@ -458,4 +459,82 @@ def products(date_from, date_to, filters):
             "cpc": _unit(tot_exp, tot_clicks),
         },
         "items": items,
+    }
+
+
+def _day_weights(days, phase):
+    n = len(days)
+    out = []
+    for i, d in enumerate(days):
+        t = i / max(n - 1, 1)
+        if t < 0.22:
+            w = 0.32 + 3.1 * t
+        elif t < 0.72:
+            w = 0.96 + 0.07 * math.sin((t * 9) + phase)
+        else:
+            w = 1.03 - 0.32 * ((t - 0.72) / 0.28)
+        if d.weekday() >= 5:
+            w *= 0.82
+        out.append(max(w, 0.06))
+    return out
+
+
+def _distribute(total, weights):
+    total = float(total or 0)
+    if not weights:
+        return []
+    s = sum(weights)
+    raw = [total * w / s for w in weights]
+    rounded = [round(v, 2) for v in raw]
+    drift = round(total - sum(rounded), 2)
+    if rounded:
+        rounded[-1] = round(rounded[-1] + drift, 2)
+        if rounded[-1] < 0:
+            rounded[-1] = 0.0
+    return rounded
+
+
+def chart(date_from, date_to, filters):
+    payload = products(date_from, date_to, filters)
+    days = []
+    if date_from and date_to:
+        cur = date_from
+        while cur <= date_to:
+            days.append(cur)
+            cur += timedelta(days=1)
+    series = []
+    total_pts = [0.0] * len(days)
+    for idx, item in enumerate(payload["items"]):
+        weights = _day_weights(days, idx * 0.7)
+        values = _distribute(item.get("expense") or 0, weights)
+        for i, val in enumerate(values):
+            total_pts[i] += val
+        series.append(
+            {
+                "id": item["sku"],
+                "name": item["name"],
+                "points": [
+                    {"date": days[i].isoformat(), "value": values[i]}
+                    for i in range(len(days))
+                ],
+            }
+        )
+    series.insert(
+        0,
+        {
+            "id": "total",
+            "name": "Итого",
+            "points": [
+                {"date": days[i].isoformat(), "value": round(total_pts[i], 2)}
+                for i in range(len(days))
+            ],
+        },
+    )
+    return {
+        "demo": True,
+        "from": date_from.isoformat() if date_from else None,
+        "to": date_to.isoformat() if date_to else None,
+        "metric": "expense",
+        "metric_label": "Расход, ₽",
+        "series": series,
     }

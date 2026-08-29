@@ -44,6 +44,8 @@ const CAMP_ORDER = [
   ["other", "pill--na", "Нет статуса"],
 ];
 const GROUP_FIELDS = ["g1", "g2", "g3"];
+const TOTAL_CHART_ID = "total";
+const CHART_COLORS = ["#005bff", "#16a34a", "#f59e0b", "#7c3aed", "#dc2626", "#0891b2", "#db2777", "#0f766e"];
 
 const CHECK_LABELS = {
   artic: { empty: "Артикул", chip: "Артикул" },
@@ -108,6 +110,10 @@ const state = {
   page: 1,
   pageSize: 50,
   cols: loadCols(),
+  chartGrain: "week",
+  chartExpanded: false,
+  chartOn: new Set([TOTAL_CHART_ID]),
+  chartData: null,
 };
 
 const esc = (s) =>
@@ -638,6 +644,191 @@ function setManagers(names) {
   state.lists.manager = cloneChecks(items);
 }
 
+function eyeBtn(id) {
+  const on = state.chartOn.has(id);
+  return `<button type="button" class="eye-btn${on ? " is-on" : ""}" data-chart-id="${esc(id)}" title="${on ? "Убрать с графика" : "Показать на графике"}" aria-pressed="${on ? "true" : "false"}" aria-label="На графике">
+    <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+      <path d="M2.4 12s3.4-7 9.6-7 9.6 7 9.6 7-3.4 7-9.6 7-9.6-7-9.6-7Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+      <circle cx="12" cy="12" r="2.7" fill="${on ? "currentColor" : "none"}" stroke="currentColor" stroke-width="1.8"/>
+    </svg>
+  </button>`;
+}
+
+function mondayIso(s) {
+  const d = parseYmd(s);
+  d.setDate(d.getDate() - ((d.getDay() + 6) % 7));
+  return iso(d);
+}
+
+function fmtShort(s) {
+  if (!s) return "";
+  const d = parseYmd(s);
+  return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function bucketPoints(points, grain) {
+  if (!points || !points.length) return [];
+  if (grain !== "week") {
+    return points.map((p) => ({ date: p.date, value: Number(p.value) || 0, label: fmtShort(p.date) }));
+  }
+  const map = new Map();
+  for (const p of points) {
+    const key = mondayIso(p.date);
+    map.set(key, (map.get(key) || 0) + (Number(p.value) || 0));
+  }
+  return [...map.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([date, value]) => ({ date, value, label: fmtShort(date) }));
+}
+
+function niceMax(v) {
+  if (!Number.isFinite(v) || v <= 0) return 1;
+  const pow = 10 ** Math.floor(Math.log10(v));
+  const n = v / pow;
+  const nice = n <= 1 ? 1 : n <= 2 ? 2 : n <= 5 ? 5 : 10;
+  return nice * pow;
+}
+
+function trimNum(v) {
+  const s = v >= 10 ? String(Math.round(v)) : String(Math.round(v * 10) / 10);
+  return s.replace(".", ",");
+}
+
+function fmtAxis(v) {
+  if (v >= 1_000_000) return `${trimNum(v / 1_000_000)} млн`;
+  if (v >= 1000) return `${trimNum(v / 1000)} тыс`;
+  return String(Math.round(v));
+}
+
+function visibleChartSeries() {
+  const all = state.chartData?.series || [];
+  return all.filter((s) => state.chartOn.has(s.id));
+}
+
+function renderChart() {
+  const card = $("chartCard");
+  const svgBox = $("chartSvg");
+  const legend = $("chartLegend");
+  const empty = $("chartEmpty");
+  const yLabel = $("chartYLabel");
+  const tip = $("chartTip");
+  if (!card || !svgBox) return;
+  if (!state.chartData) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  card.classList.toggle("is-wide", state.chartExpanded);
+  $("chartExpand").textContent = state.chartExpanded ? "Свернуть график" : "Развернуть график";
+  document.querySelectorAll("#chartGrain [data-grain]").forEach((btn) => {
+    btn.classList.toggle("is-on", btn.dataset.grain === state.chartGrain);
+  });
+  if (yLabel) yLabel.textContent = state.chartData.metric_label || "Расход, ₽";
+
+  const series = visibleChartSeries().map((s, i) => ({
+    ...s,
+    color: CHART_COLORS[i % CHART_COLORS.length],
+    points: bucketPoints(s.points, state.chartGrain),
+  }));
+  if (!series.length || series.every((s) => !s.points.length)) {
+    svgBox.innerHTML = "";
+    legend.innerHTML = "";
+    empty.hidden = false;
+    return;
+  }
+  empty.hidden = true;
+  legend.innerHTML = series
+    .map(
+      (s) => `<span class="chart-legend__item" style="color:${s.color}">
+        <span class="chart-legend__dot"></span>${esc(s.name)}
+      </span>`
+    )
+    .join("");
+
+  const labels = series[0].points.map((p) => p.label);
+  const maxVal = niceMax(Math.max(0, ...series.flatMap((s) => s.points.map((p) => p.value))));
+  const w = Math.max(svgBox.clientWidth || 640, 320);
+  const h = svgBox.clientHeight || 240;
+  const pad = { l: 48, r: 12, t: 18, b: 28 };
+  const innerW = Math.max(1, w - pad.l - pad.r);
+  const innerH = Math.max(1, h - pad.t - pad.b);
+  const xAt = (i, n) => pad.l + (n <= 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+  const yAt = (v) => pad.t + innerH - (v / maxVal) * innerH;
+  const ticks = 3;
+  let grid = "";
+  for (let i = 0; i <= ticks; i += 1) {
+    const v = (maxVal * (ticks - i)) / ticks;
+    const y = yAt(v);
+    grid += `<line x1="${pad.l}" x2="${w - pad.r}" y1="${y}" y2="${y}" stroke="#eef2f6" stroke-width="1"/>`;
+    grid += `<text x="${pad.l - 8}" y="${y + 3}" text-anchor="end" fill="#98a2b3" font-size="11">${esc(fmtAxis(v))}</text>`;
+  }
+  const n = labels.length;
+  const labelStep = Math.max(1, Math.ceil(n / 6));
+  let xLabels = "";
+  labels.forEach((lab, i) => {
+    if (i % labelStep !== 0 && i !== n - 1) return;
+    xLabels += `<text x="${xAt(i, n)}" y="${h - 6}" text-anchor="middle" fill="#98a2b3" font-size="11">${esc(lab)}</text>`;
+  });
+  const lines = series
+    .map((s) => {
+      const d = s.points.map((p, i) => `${i ? "L" : "M"}${xAt(i, n)} ${yAt(p.value)}`).join(" ");
+      return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
+    })
+    .join("");
+  svgBox.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img">${grid}${lines}${xLabels}</svg>`;
+
+  const hover = (ev) => {
+    const rect = svgBox.getBoundingClientRect();
+    const x = ev.clientX - rect.left;
+    if (n <= 0) return;
+    let idx = 0;
+    let best = Infinity;
+    for (let i = 0; i < n; i += 1) {
+      const dx = Math.abs(xAt(i, n) - x);
+      if (dx < best) {
+        best = dx;
+        idx = i;
+      }
+    }
+    const rows = series
+      .map((s) => `<div><b style="color:${s.color}">${esc(s.name)}</b>: ${money(s.points[idx]?.value)}</div>`)
+      .join("");
+    tip.hidden = false;
+    tip.innerHTML = `<div>${esc(labels[idx])} · ${esc(state.chartData.metric_label || "Расход, ₽")}</div>${rows}`;
+    const left = Math.min(rect.width - 160, Math.max(8, x + 12));
+    tip.style.left = `${left}px`;
+    tip.style.top = `12px`;
+  };
+  svgBox.onmousemove = hover;
+  svgBox.onmouseleave = () => {
+    tip.hidden = true;
+  };
+}
+
+function toggleChartId(id) {
+  if (state.chartOn.has(id)) state.chartOn.delete(id);
+  else state.chartOn.add(id);
+  render();
+  renderChart();
+}
+
+function requestBody() {
+  return {
+    from: state.from,
+    to: state.to || state.from,
+    g: state.applied.g1,
+    g1: state.applied.g2,
+    g2: state.applied.g3,
+    manager: selectedFrom(state.applied.lists.manager),
+    artic: selectedFrom(state.applied.lists.artic),
+    code: selectedFrom(state.applied.lists.code),
+    nom: selectedFrom(state.applied.lists.nom),
+    sku: selectedFrom(state.applied.lists.sku),
+    campaign_id: selectedFrom(state.applied.lists.campaign),
+    statuses: state.applied.statuses,
+  };
+}
+
 function campCount(items) {
   return items.reduce((n, p) => n + CAMP_KEYS.reduce((m, k) => m + (p.campaigns[k] || []).length, 0), 0);
 }
@@ -732,7 +923,7 @@ function render() {
   hint.hidden = true;
   renderMetricHead();
   $("total").innerHTML = `
-    <div class="prod"><div class="prod__name">Итого</div></div>
+    <div class="prod">${eyeBtn(TOTAL_CHART_ID)}<div class="prod__name">Итого</div></div>
     ${metrics(data.totals)}
   `;
 
@@ -768,6 +959,7 @@ function render() {
                 <path d="M6 3.2 11.2 8 6 12.8" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
             </button>
+            ${eyeBtn(p.sku)}
             ${img}
             <div class="prod__text">
               <div class="prod__name" title="${esc(p.name)}">${esc(p.name)}</div>
@@ -787,6 +979,12 @@ function render() {
       btn.closest(".prod-row").classList.toggle("open");
     });
   });
+  document.querySelectorAll("[data-chart-id]").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      toggleChartId(btn.dataset.chartId);
+    });
+  });
   renderPager(filtered);
   syncHScroll();
 }
@@ -795,8 +993,13 @@ async function loadMeta() {
   const meta = await (await fetch("/api/meta")).json();
   state.minDate = meta.min_date;
   state.maxDate = meta.max_date;
-  state.from = meta.max_date;
-  state.to = meta.max_date;
+  if (meta.demo && meta.min_date && meta.max_date) {
+    state.from = meta.min_date;
+    state.to = meta.max_date;
+  } else {
+    state.from = meta.max_date;
+    state.to = meta.max_date;
+  }
   state.draftFrom = meta.max_date;
   state.draftTo = meta.max_date;
   state.view = new Date(parseYmd(meta.max_date).getFullYear(), parseYmd(meta.max_date).getMonth() - 1, 1);
@@ -810,41 +1013,40 @@ async function loadMeta() {
 }
 
 async function loadProducts() {
-  const body = {
-    from: state.from,
-    to: state.to || state.from,
-    g: state.applied.g1,
-    g1: state.applied.g2,
-    g2: state.applied.g3,
-    manager: selectedFrom(state.applied.lists.manager),
-    artic: selectedFrom(state.applied.lists.artic),
-    code: selectedFrom(state.applied.lists.code),
-    nom: selectedFrom(state.applied.lists.nom),
-    sku: selectedFrom(state.applied.lists.sku),
-    campaign_id: selectedFrom(state.applied.lists.campaign),
-    statuses: state.applied.statuses,
-  };
+  const body = requestBody();
 
   $("hint").hidden = false;
   $("hint").textContent = "Загрузка…";
   $("apply").disabled = true;
   $("spinner").hidden = false;
   try {
-    const res = await fetch("/api/products", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    if (!res.ok) throw new Error(await res.text());
-    state.data = await res.json();
+    const [prodRes, chartRes] = await Promise.all([
+      fetch("/api/products", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+      fetch("/api/chart", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      }),
+    ]);
+    if (!prodRes.ok) throw new Error(await prodRes.text());
+    if (!chartRes.ok) throw new Error(await chartRes.text());
+    state.data = await prodRes.json();
+    state.chartData = await chartRes.json();
+    state.chartOn = new Set([TOTAL_CHART_ID]);
     state.page = 1;
     render();
+    renderChart();
   } catch (err) {
     $("hint").hidden = false;
     $("hint").textContent = `Ошибка: ${err.message}`;
     $("list").innerHTML = "";
     $("total").innerHTML = "";
     $("pager").hidden = true;
+    $("chartCard").hidden = true;
   } finally {
     $("apply").disabled = false;
     $("spinner").hidden = true;
@@ -877,6 +1079,16 @@ function resetFilters() {
 
 $("apply").addEventListener("click", loadProducts);
 $("reset").addEventListener("click", resetFilters);
+$("chartExpand").addEventListener("click", () => {
+  state.chartExpanded = !state.chartExpanded;
+  renderChart();
+});
+$("chartGrain").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-grain]");
+  if (!btn) return;
+  state.chartGrain = btn.dataset.grain;
+  renderChart();
+});
 
 $("rangeBtn").addEventListener("click", (e) => {
   e.stopPropagation();
@@ -1066,7 +1278,10 @@ $("pageButtons").addEventListener("click", (e) => {
 });
 
 document.addEventListener("click", closeAllPops);
-window.addEventListener("resize", syncHScroll);
+window.addEventListener("resize", () => {
+  syncHScroll();
+  renderChart();
+});
 
 const tableScroll = $("tableScroll");
 const hscroll = $("hscroll");

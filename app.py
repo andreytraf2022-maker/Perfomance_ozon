@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
 
@@ -164,6 +164,181 @@ def req_list(name):
     return split_list(vals)
 
 
+def each_day(start, end):
+    if not start or not end:
+        return []
+    days = []
+    cur = start
+    while cur <= end:
+        days.append(cur)
+        cur += timedelta(days=1)
+    return days
+
+
+def parse_report_request():
+    mn, mx = date_bounds()
+    raw_from = req_val("from")
+    raw_to = req_val("to")
+    date_from = (
+        datetime.strptime(str(raw_from), "%Y-%m-%d").date() if raw_from else mx
+    )
+    date_to = datetime.strptime(str(raw_to), "%Y-%m-%d").date() if raw_to else mx
+    if date_from and date_to and date_from > date_to:
+        date_from, date_to = date_to, date_from
+
+    groups1 = req_list("g")
+    groups2 = req_list("g1")
+    groups3 = req_list("g2")
+    managers = req_list("manager")
+    artic = req_list("artic")
+    code = req_list("code")
+    nom = req_list("nom")
+    skus = req_list("sku")
+    campaign_ids = req_list("campaign_id")
+    body = request.get_json(silent=True) or {}
+    if request.is_json and "statuses" in body:
+        statuses = split_list(body.get("statuses"))
+    elif request.args.getlist("statuses"):
+        statuses = req_list("statuses")
+    else:
+        statuses = ["Активна", "Запланирована", "Приостановлена"]
+    status_set = {s.strip() for s in statuses if str(s).strip()}
+
+    extra = []
+    extra_params: list = []
+    add_str_filter("LTRIM(RTRIM(gr.g))", groups1, extra, extra_params, exact=True)
+    add_str_filter("LTRIM(RTRIM(gr.g1))", groups2, extra, extra_params, exact=True)
+    add_str_filter("LTRIM(RTRIM(gr.g2))", groups3, extra, extra_params, exact=True)
+    named_managers = [m for m in managers if m != "Без менеджера"]
+    want_empty_mgr = "Без менеджера" in managers
+    if want_empty_mgr and named_managers:
+        ph = ",".join("?" * len(named_managers))
+        extra.append(
+            f"(NULLIF(LTRIM(RTRIM(n.manager)), N'') IS NULL OR LTRIM(RTRIM(n.manager)) IN ({ph}))"
+        )
+        extra_params.extend(named_managers)
+    elif want_empty_mgr:
+        extra.append("NULLIF(LTRIM(RTRIM(n.manager)), N'') IS NULL")
+    else:
+        add_str_filter("LTRIM(RTRIM(n.manager))", named_managers, extra, extra_params, exact=True)
+    add_str_filter("n.artic", artic, extra, extra_params, exact=True)
+    add_str_filter("n.code", code, extra, extra_params, exact=True)
+    add_str_filter(
+        "COALESCE(n.description, a.nom_tbl, a.product_name)",
+        nom,
+        extra,
+        extra_params,
+        exact=True,
+    )
+    add_str_filter("a.sku", skus, extra, extra_params, exact=True)
+    add_str_filter("a.campaign_id", campaign_ids, extra, extra_params, exact=True)
+    extra_sql = (" AND " + " AND ".join(extra)) if extra else ""
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "extra_sql": extra_sql,
+        "params": [date_from, date_to, *extra_params],
+        "status_set": status_set,
+        "filters": {
+            "statuses": list(status_set),
+            "artic": artic,
+            "code": code,
+            "nom": nom,
+            "sku": skus,
+            "campaign_id": campaign_ids,
+        },
+    }
+
+
+SRC_CTE = """
+    WITH ads AS (
+        SELECT
+            LTRIM(RTRIM(t.sku)) AS sku,
+            LTRIM(RTRIM(CAST(t.campaign_id AS nvarchar(64)))) AS campaign_id,
+            t.campaign_name,
+            t.status,
+            t.strategy,
+            t.placement,
+            t.report_date,
+            CAST(ISNULL(t.sales, 0) AS decimal(18, 2)) AS sales,
+            CAST(ISNULL(t.expense, 0) AS decimal(18, 2)) AS expense,
+            CAST(ISNULL(t.views, 0) AS bigint) AS views,
+            CAST(ISNULL(t.clicks, 0) AS bigint) AS clicks,
+            CAST(ISNULL(t.to_cart, 0) AS bigint) AS to_cart,
+            CAST(ISNULL(t.model_orders, 0) AS bigint) AS model_orders,
+            CAST(ISNULL(t.model_sales, 0) AS decimal(18, 2)) AS model_sales,
+            CAST(t.weekly_budget AS decimal(18, 2)) AS weekly_budget,
+            CAST(t.date_added AS date) AS date_added,
+            CAST(t.product_gmv AS decimal(18, 2)) AS product_gmv,
+            t.[Номенклатура] AS nom_tbl,
+            t.product_name
+        FROM ext_belousov.ozon_perfomance AS t
+        WHERE t.report_date >= ? AND t.report_date <= ?
+    ),
+    nom AS (
+        SELECT
+            LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64)))) AS sku,
+            MAX(n.description) AS description,
+            MAX(n.artic) AS artic,
+            MAX(LTRIM(RTRIM(n.code))) AS code,
+            MAX(n.photo) AS photo,
+            MAX(n.[1c_group]) AS [1c_group],
+            MAX(LTRIM(RTRIM(n.[Менеджер OZON]))) AS manager
+        FROM pbi.nomenclature AS n
+        WHERE NULLIF(LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64)))), N'') IS NOT NULL
+        GROUP BY LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64))))
+    ),
+    src AS (
+        SELECT
+            a.sku,
+            a.campaign_id,
+            a.campaign_name,
+            a.status,
+            a.strategy,
+            a.placement,
+            a.report_date,
+            a.sales,
+            a.expense,
+            a.views,
+            a.clicks,
+            a.to_cart,
+            a.model_orders,
+            a.model_sales,
+            a.weekly_budget,
+            a.date_added,
+            a.product_gmv,
+            COALESCE(n.description, a.nom_tbl, a.product_name) AS nom_name,
+            n.artic,
+            n.code,
+            n.photo,
+            n.manager
+        FROM ads AS a
+        LEFT JOIN nom AS n ON n.sku = a.sku
+        LEFT JOIN pbi.groups AS gr ON gr.[1c_id] = n.[1c_group]
+        WHERE 1 = 1{extra_sql}
+    ),
+    camp_status AS (
+        SELECT sku, campaign_id, status, strategy, placement
+        FROM (
+            SELECT
+                sku,
+                campaign_id,
+                status,
+                strategy,
+                placement,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sku, campaign_id
+                    ORDER BY
+                        CASE WHEN status IS NULL OR LTRIM(RTRIM(status)) = N'' THEN 1 ELSE 0 END,
+                        report_date DESC
+                ) AS rn
+            FROM src
+        ) x
+        WHERE rn = 1
+    )
+"""
+
+
 def add_str_filter(expr, values, extra, extra_params, exact=False):
     values = _uniq(values)
     if not values:
@@ -285,152 +460,17 @@ def api_groups():
 @app.get("/api/products")
 @app.post("/api/products")
 def api_products():
-    mn, mx = date_bounds()
-    raw_from = req_val("from")
-    raw_to = req_val("to")
-    date_from = (
-        datetime.strptime(str(raw_from), "%Y-%m-%d").date() if raw_from else mx
-    )
-    date_to = datetime.strptime(str(raw_to), "%Y-%m-%d").date() if raw_to else mx
-    if date_from and date_to and date_from > date_to:
-        date_from, date_to = date_to, date_from
-
-    groups1 = req_list("g")
-    groups2 = req_list("g1")
-    groups3 = req_list("g2")
-    managers = req_list("manager")
-    artic = req_list("artic")
-    code = req_list("code")
-    nom = req_list("nom")
-    skus = req_list("sku")
-    campaign_ids = req_list("campaign_id")
-    body = request.get_json(silent=True) or {}
-    artic_exact = True
-    code_exact = True
-    nom_exact = True
-    if request.is_json and "statuses" in body:
-        statuses = split_list(body.get("statuses"))
-    elif request.args.getlist("statuses"):
-        statuses = req_list("statuses")
-    else:
-        statuses = ["Активна", "Запланирована", "Приостановлена"]
-    status_set = {s.strip() for s in statuses if str(s).strip()}
-
-    extra = []
-    extra_params: list = []
-    add_str_filter("LTRIM(RTRIM(gr.g))", groups1, extra, extra_params, exact=True)
-    add_str_filter("LTRIM(RTRIM(gr.g1))", groups2, extra, extra_params, exact=True)
-    add_str_filter("LTRIM(RTRIM(gr.g2))", groups3, extra, extra_params, exact=True)
-    named_managers = [m for m in managers if m != "Без менеджера"]
-    want_empty_mgr = "Без менеджера" in managers
-    if want_empty_mgr and named_managers:
-        ph = ",".join("?" * len(named_managers))
-        extra.append(
-            f"(NULLIF(LTRIM(RTRIM(n.manager)), N'') IS NULL OR LTRIM(RTRIM(n.manager)) IN ({ph}))"
-        )
-        extra_params.extend(named_managers)
-    elif want_empty_mgr:
-        extra.append("NULLIF(LTRIM(RTRIM(n.manager)), N'') IS NULL")
-    else:
-        add_str_filter("LTRIM(RTRIM(n.manager))", named_managers, extra, extra_params, exact=True)
-    add_str_filter("n.artic", artic, extra, extra_params, exact=artic_exact)
-    add_str_filter("n.code", code, extra, extra_params, exact=code_exact)
-    add_str_filter(
-        "COALESCE(n.description, a.nom_tbl, a.product_name)",
-        nom,
-        extra,
-        extra_params,
-        exact=nom_exact,
-    )
-    add_str_filter("a.sku", skus, extra, extra_params, exact=True)
-    add_str_filter("a.campaign_id", campaign_ids, extra, extra_params, exact=True)
-
-    extra_sql = (" AND " + " AND ".join(extra)) if extra else ""
-    params: list = [date_from, date_to, *extra_params]
+    ctx = parse_report_request()
+    date_from = ctx["date_from"]
+    date_to = ctx["date_to"]
+    extra_sql = ctx["extra_sql"]
+    params = ctx["params"]
+    status_set = ctx["status_set"]
 
     if demo_mode():
-        return jsonify(
-            demo.products(
-                date_from,
-                date_to,
-                {
-                    "statuses": list(status_set),
-                    "artic": artic,
-                    "code": code,
-                    "nom": nom,
-                    "sku": skus,
-                    "campaign_id": campaign_ids,
-                },
-            )
-        )
+        return jsonify(demo.products(date_from, date_to, ctx["filters"]))
 
-    sql = f"""
-    WITH ads AS (
-        SELECT
-            LTRIM(RTRIM(t.sku)) AS sku,
-            LTRIM(RTRIM(CAST(t.campaign_id AS nvarchar(64)))) AS campaign_id,
-            t.campaign_name,
-            t.status,
-            t.strategy,
-            t.placement,
-            t.report_date,
-            CAST(ISNULL(t.sales, 0) AS decimal(18, 2)) AS sales,
-            CAST(ISNULL(t.expense, 0) AS decimal(18, 2)) AS expense,
-            CAST(ISNULL(t.views, 0) AS bigint) AS views,
-            CAST(ISNULL(t.clicks, 0) AS bigint) AS clicks,
-            CAST(ISNULL(t.to_cart, 0) AS bigint) AS to_cart,
-            CAST(ISNULL(t.model_orders, 0) AS bigint) AS model_orders,
-            CAST(ISNULL(t.model_sales, 0) AS decimal(18, 2)) AS model_sales,
-            CAST(t.weekly_budget AS decimal(18, 2)) AS weekly_budget,
-            CAST(t.date_added AS date) AS date_added,
-            CAST(t.product_gmv AS decimal(18, 2)) AS product_gmv,
-            t.[Номенклатура] AS nom_tbl,
-            t.product_name
-        FROM ext_belousov.ozon_perfomance AS t
-        WHERE t.report_date >= ? AND t.report_date <= ?
-    ),
-    nom AS (
-        SELECT
-            LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64)))) AS sku,
-            MAX(n.description) AS description,
-            MAX(n.artic) AS artic,
-            MAX(LTRIM(RTRIM(n.code))) AS code,
-            MAX(n.photo) AS photo,
-            MAX(n.[1c_group]) AS [1c_group],
-            MAX(LTRIM(RTRIM(n.[Менеджер OZON]))) AS manager
-        FROM pbi.nomenclature AS n
-        WHERE NULLIF(LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64)))), N'') IS NOT NULL
-        GROUP BY LTRIM(RTRIM(CAST(n.[ID OZON] AS nvarchar(64))))
-    ),
-    src AS (
-        SELECT
-            a.sku,
-            a.campaign_id,
-            a.campaign_name,
-            a.status,
-            a.strategy,
-            a.placement,
-            a.report_date,
-            a.sales,
-            a.expense,
-            a.views,
-            a.clicks,
-            a.to_cart,
-            a.model_orders,
-            a.model_sales,
-            a.weekly_budget,
-            a.date_added,
-            a.product_gmv,
-            COALESCE(n.description, a.nom_tbl, a.product_name) AS nom_name,
-            n.artic,
-            n.code,
-            n.photo,
-            n.manager
-        FROM ads AS a
-        LEFT JOIN nom AS n ON n.sku = a.sku
-        LEFT JOIN pbi.groups AS gr ON gr.[1c_id] = n.[1c_group]
-        WHERE 1 = 1{extra_sql}
-    ),
+    sql = SRC_CTE.format(extra_sql=extra_sql).rstrip() + """,
     sku_gmv AS (
         SELECT sku, SUM(day_gmv) AS gmv
         FROM (
@@ -470,25 +510,6 @@ def api_products():
             MIN(date_added) AS date_added
         FROM src
         GROUP BY sku, campaign_id
-    ),
-    camp_status AS (
-        SELECT sku, campaign_id, status, strategy, placement
-        FROM (
-            SELECT
-                sku,
-                campaign_id,
-                status,
-                strategy,
-                placement,
-                ROW_NUMBER() OVER (
-                    PARTITION BY sku, campaign_id
-                    ORDER BY
-                        CASE WHEN status IS NULL OR LTRIM(RTRIM(status)) = N'' THEN 1 ELSE 0 END,
-                        report_date DESC
-                ) AS rn
-            FROM src
-        ) x
-        WHERE rn = 1
     )
     SELECT
         a.sku,
@@ -665,6 +686,116 @@ def api_products():
                 "cpc": unit_price(tot_exp, tot_clicks),
             },
             "items": items,
+        }
+    )
+
+
+def empty_chart(date_from, date_to, demo=False):
+    days = each_day(date_from, date_to)
+    return {
+        "demo": demo,
+        "from": date_from.isoformat() if date_from else None,
+        "to": date_to.isoformat() if date_to else None,
+        "metric": "expense",
+        "metric_label": "Расход, ₽",
+        "series": [
+            {
+                "id": "total",
+                "name": "Итого",
+                "points": [
+                    {"date": d.isoformat(), "value": 0} for d in days
+                ],
+            }
+        ],
+    }
+
+
+def pack_chart_series(date_from, date_to, rows):
+    days = each_day(date_from, date_to)
+    by_sku: dict[str, dict] = {}
+    for row in rows:
+        sku = str(row["sku"] or "").strip()
+        if not sku:
+            continue
+        day = row["report_date"]
+        if hasattr(day, "isoformat"):
+            day_s = day.isoformat()[:10]
+        else:
+            day_s = str(day)[:10]
+        item = by_sku.setdefault(
+            sku, {"name": row.get("nom_name") or sku, "vals": {}}
+        )
+        if row.get("nom_name"):
+            item["name"] = row["nom_name"]
+        item["vals"][day_s] = item["vals"].get(day_s, 0) + num(row.get("expense"))
+    series = []
+    total_vals = {d.isoformat(): 0.0 for d in days}
+    ranked = sorted(
+        by_sku.items(),
+        key=lambda kv: -sum(kv[1]["vals"].values()),
+    )
+    for sku, item in ranked:
+        points = []
+        for d in days:
+            key = d.isoformat()
+            val = round(float(item["vals"].get(key, 0)), 2)
+            total_vals[key] += val
+            points.append({"date": key, "value": val})
+        series.append({"id": sku, "name": item["name"], "points": points})
+    series.insert(
+        0,
+        {
+            "id": "total",
+            "name": "Итого",
+            "points": [
+                {"date": d.isoformat(), "value": round(total_vals[d.isoformat()], 2)}
+                for d in days
+            ],
+        },
+    )
+    return series
+
+
+@app.get("/api/chart")
+@app.post("/api/chart")
+def api_chart():
+    ctx = parse_report_request()
+    date_from = ctx["date_from"]
+    date_to = ctx["date_to"]
+    if demo_mode():
+        return jsonify(demo.chart(date_from, date_to, ctx["filters"]))
+
+    status_set = ctx["status_set"]
+    if not date_from or not date_to or not status_set:
+        return jsonify(empty_chart(date_from, date_to))
+
+    status_list = list(status_set)
+    status_ph = ",".join("?" * len(status_list))
+    sql = SRC_CTE.format(extra_sql=ctx["extra_sql"]).rstrip() + f"""
+    SELECT
+        s.sku,
+        MAX(s.nom_name) AS nom_name,
+        CAST(s.report_date AS date) AS report_date,
+        SUM(s.expense) AS expense
+    FROM src AS s
+    INNER JOIN camp_status AS cs
+        ON cs.sku = s.sku AND cs.campaign_id = s.campaign_id
+    WHERE LTRIM(RTRIM(ISNULL(cs.status, N''))) IN ({status_ph})
+    GROUP BY s.sku, CAST(s.report_date AS date)
+    ORDER BY s.sku, CAST(s.report_date AS date);
+    """
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, [*ctx["params"], *status_list])
+        raw = rows_dicts(cur)
+    return jsonify(
+        {
+            "demo": False,
+            "from": date_from.isoformat(),
+            "to": date_to.isoformat(),
+            "metric": "expense",
+            "metric_label": "Расход, ₽",
+            "series": pack_chart_series(date_from, date_to, raw),
         }
     )
 

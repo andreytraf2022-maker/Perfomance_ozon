@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OZON Performance — товары</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/app.css?v=12">
+  <link rel="stylesheet" href="/static/app.css?v=13">
 </head>
 <body>
   <header class="top">
@@ -270,6 +270,26 @@
 
   <div id="hint" class="status" hidden></div>
 
+  <section class="chart-card" id="chartCard" hidden>
+    <div class="chart-card__head">
+      <div class="chart-card__title">График</div>
+      <div class="chart-card__tools">
+        <button type="button" class="chart-link" id="chartExpand">Развернуть график</button>
+        <div class="chart-grain" id="chartGrain">
+          <button type="button" data-grain="day">День</button>
+          <button type="button" class="is-on" data-grain="week">Неделя</button>
+        </div>
+      </div>
+    </div>
+    <div class="chart-card__plot" id="chartPlot">
+      <div class="chart-y" id="chartYLabel">Расход, ₽</div>
+      <div class="chart-svg" id="chartSvg"></div>
+      <div class="chart-tip" id="chartTip" hidden></div>
+    </div>
+    <div class="chart-legend" id="chartLegend"></div>
+    <div class="chart-empty" id="chartEmpty" hidden>Включите глазик у «Итого» или у товара, чтобы показать ряд на графике</div>
+  </section>
+
   <div class="table-shell">
     <div class="table-toolbar">
       <div class="range-wrap" id="colsWrap">
@@ -325,6 +345,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=12"></script>
+  <script src="/static/app.js?v=13"></script>
 </body>
 </html>
