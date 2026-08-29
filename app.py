@@ -4,13 +4,12 @@ from __future__ import annotations
 import io
 import os
 import re
-from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
 from urllib.parse import quote
 
-import xlwt
+import xlsxwriter
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 import demo
@@ -892,8 +891,6 @@ def api_chart():
 
 
 EXPORT_HEADERS = [
-    "Дата",
-    "Тип",
     "SKU",
     "Артикул",
     "Код",
@@ -944,7 +941,13 @@ def _xls_num(v, nd=2):
     return round(n, nd)
 
 
-def _export_line(kind, day, meta, metrics, camp=None):
+def _add_period(dst, src):
+    for key in ("sales", "expense", "views", "clicks", "to_cart", "model_orders", "model_sales", "gmv"):
+        dst[key] = num(dst.get(key)) + num(src.get(key))
+    dst["budget"] = max(num(dst.get("budget")), num(src.get("budget")))
+
+
+def _export_line(meta, metrics, camp):
     sales = num(metrics.get("sales"))
     expense = num(metrics.get("expense"))
     views = num(metrics.get("views"))
@@ -955,10 +958,7 @@ def _export_line(kind, day, meta, metrics, camp=None):
     general_drr = ratio(expense, gmv_n)
     ctr = ratio(clicks, views)
     cpc = unit_price(expense, clicks)
-    camp = camp or {}
     return [
-        _xls_date(day),
-        kind,
         meta.get("sku") or "",
         meta.get("artic") or "",
         meta.get("code") or "",
@@ -982,112 +982,102 @@ def _export_line(kind, day, meta, metrics, camp=None):
         _xls_num(metrics.get("to_cart"), 0),
         _xls_num(metrics.get("model_orders"), 0),
         _xls_num(metrics.get("model_sales")),
-        _xls_date(meta.get("date_added") if kind == "Товар" else camp.get("date_added")),
+        _xls_date(camp.get("date_added") or meta.get("date_added")),
     ]
 
 
 def pack_export_rows(raw):
-    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
-    sku_meta: dict[str, dict] = {}
+    camps = {}
     for row in raw:
         sku = str(row.get("sku") or "").strip()
         camp_id = str(row.get("campaign_id") or "").strip()
         if not sku or not camp_id:
             continue
-        day = row.get("report_date")
-        day_s = day.isoformat()[:10] if hasattr(day, "isoformat") else str(day)[:10]
-        groups[(sku, day_s)].append(row)
-        prev = sku_meta.get(sku) or {}
-        sku_meta[sku] = {
-            "sku": sku,
-            "name": row.get("nom_name") or prev.get("name") or sku,
-            "artic": row.get("artic") or prev.get("artic"),
-            "code": row.get("code") or prev.get("code"),
-            "manager": row.get("manager") or prev.get("manager"),
-            "date_added": row.get("date_added") or prev.get("date_added"),
-            "expense": num(prev.get("expense")) + num(row.get("expense")),
-        }
-
-    sku_order = sorted(sku_meta, key=lambda s: -sku_meta[s]["expense"])
-    rows = []
-    for sku in sku_order:
-        days = sorted({day for s, day in groups if s == sku})
-        meta = sku_meta[sku]
-        for day_s in days:
-            camps = groups[(sku, day_s)]
-            acc = {
-                "sales": 0.0,
-                "expense": 0.0,
-                "views": 0.0,
-                "clicks": 0.0,
-                "to_cart": 0.0,
-                "model_orders": 0.0,
-                "model_sales": 0.0,
-                "budget": 0.0,
-                "gmv": 0.0,
+        key = (sku, camp_id)
+        item = camps.get(key)
+        if item is None:
+            item = {
+                "meta": {
+                    "sku": sku,
+                    "name": row.get("nom_name") or sku,
+                    "artic": row.get("artic"),
+                    "code": row.get("code"),
+                    "manager": row.get("manager"),
+                    "date_added": row.get("date_added"),
+                },
+                "camp": {
+                    "id": camp_id,
+                    "name": row.get("campaign_name") or camp_id,
+                    "status": (row.get("status") or "").strip(),
+                    "strategy": (row.get("strategy") or "").strip(),
+                    "placement": (row.get("placement") or "").strip(),
+                    "date_added": row.get("date_added"),
+                },
+                "acc": {
+                    "sales": 0.0,
+                    "expense": 0.0,
+                    "views": 0.0,
+                    "clicks": 0.0,
+                    "to_cart": 0.0,
+                    "model_orders": 0.0,
+                    "model_sales": 0.0,
+                    "budget": 0.0,
+                    "gmv": 0.0,
+                },
             }
-            for c in camps:
-                _add_into(acc, c, gmv="max")
-            rows.append(_export_line("Товар", day_s, meta, acc))
-            for c in sorted(camps, key=lambda x: str(x.get("campaign_id") or "")):
-                camp = {
-                    "id": str(c.get("campaign_id") or ""),
-                    "name": c.get("campaign_name") or c.get("campaign_id"),
-                    "status": (c.get("status") or "").strip(),
-                    "strategy": (c.get("strategy") or "").strip(),
-                    "placement": (c.get("placement") or "").strip(),
-                    "date_added": c.get("date_added"),
-                }
-                rows.append(_export_line("Кампания", day_s, meta, c, camp))
-    return rows
+            camps[key] = item
+        else:
+            if row.get("nom_name"):
+                item["meta"]["name"] = row["nom_name"]
+            if row.get("campaign_name"):
+                item["camp"]["name"] = row["campaign_name"]
+            if row.get("date_added") and not item["camp"].get("date_added"):
+                item["camp"]["date_added"] = row["date_added"]
+        _add_period(item["acc"], row)
+    ordered = sorted(
+        camps.values(),
+        key=lambda it: (-num(it["acc"].get("expense")), it["meta"]["sku"], it["camp"]["id"]),
+    )
+    return [_export_line(it["meta"], it["acc"], it["camp"]) for it in ordered]
 
 
-def export_xls_bytes(headers, rows):
-    book = xlwt.Workbook(encoding="utf-8")
-    font_head = xlwt.Font()
-    font_head.bold = True
-    head = xlwt.XFStyle()
-    head.font = font_head
-    date_style = xlwt.XFStyle()
-    date_style.num_format_str = "DD.MM.YYYY"
-    money = xlwt.XFStyle()
-    money.num_format_str = "#,##0.00"
-    pct = xlwt.XFStyle()
-    pct.num_format_str = "0.0"
-    integer = xlwt.XFStyle()
-    integer.num_format_str = "#,##0"
-    date_cols = {0, 25}
-    money_cols = {12, 13, 14, 15, 20, 24}
-    pct_cols = {16, 17, 21}
-    int_cols = {18, 19, 22, 23}
-    max_rows = 65535
-    chunks = [rows[i : i + max_rows] for i in range(0, len(rows), max_rows)] or [[]]
-    for sheet_i, chunk in enumerate(chunks):
-        title = "Отчёт" if sheet_i == 0 else f"Отчёт{sheet_i + 1}"
-        sheet = book.add_sheet(title)
-        for col, title_cell in enumerate(headers):
-            sheet.write(0, col, title_cell, head)
-            sheet.col(col).width = 256 * (16 if col not in {5, 8} else 36)
-        for r, row in enumerate(chunk, 1):
-            for c, val in enumerate(row):
-                if val is None or val == "":
-                    continue
-                if c in date_cols and isinstance(val, date):
-                    if not isinstance(val, datetime):
-                        val = datetime(val.year, val.month, val.day)
-                    sheet.write(r, c, val, date_style)
-                elif c in money_cols and isinstance(val, (int, float)):
-                    sheet.write(r, c, float(val), money)
-                elif c in pct_cols and isinstance(val, (int, float)):
-                    sheet.write(r, c, float(val), pct)
-                elif c in int_cols and isinstance(val, (int, float)):
-                    sheet.write(r, c, int(val), integer)
-                else:
-                    sheet.write(r, c, val)
-        sheet.panes_frozen = True
-        sheet.horz_split_pos = 1
+def export_xlsx_bytes(headers, rows):
     buf = io.BytesIO()
-    book.save(buf)
+    book = xlsxwriter.Workbook(buf, {"in_memory": True, "strings_to_urls": False})
+    sheet = book.add_worksheet("Отчёт")
+    head = book.add_format({"bold": True, "bg_color": "#F3F4F6", "border": 1, "valign": "vcenter"})
+    text = book.add_format({"valign": "vcenter"})
+    money = book.add_format({"num_format": "#,##0.00", "valign": "vcenter"})
+    pct = book.add_format({"num_format": "0.0", "valign": "vcenter"})
+    integer = book.add_format({"num_format": "#,##0", "valign": "vcenter"})
+    date_fmt = book.add_format({"num_format": "DD.MM.YYYY", "valign": "vcenter"})
+    money_cols = {10, 11, 12, 13, 18, 22}
+    pct_cols = {14, 15, 19}
+    int_cols = {16, 17, 20, 21}
+    date_cols = {23}
+    widths = [14, 14, 14, 42, 18, 14, 36, 16, 22, 22, 14, 18, 18, 14, 14, 14, 12, 12, 12, 10, 18, 16, 20, 20]
+    for col, title in enumerate(headers):
+        sheet.write(0, col, title, head)
+        sheet.set_column(col, col, widths[col] if col < len(widths) else 14)
+    for r, row in enumerate(rows, 1):
+        for c, val in enumerate(row):
+            if val is None or val == "":
+                continue
+            if c in date_cols and isinstance(val, date):
+                sheet.write_datetime(r, c, datetime(val.year, val.month, val.day), date_fmt)
+            elif c in money_cols and isinstance(val, (int, float)):
+                sheet.write_number(r, c, float(val), money)
+            elif c in pct_cols and isinstance(val, (int, float)):
+                sheet.write_number(r, c, float(val), pct)
+            elif c in int_cols and isinstance(val, (int, float)):
+                sheet.write_number(r, c, int(val), integer)
+            elif isinstance(val, (int, float)):
+                sheet.write_number(r, c, float(val), text)
+            else:
+                sheet.write(r, c, val, text)
+    sheet.freeze_panes(1, 0)
+    sheet.autofilter(0, 0, max(len(rows), 1), len(headers) - 1)
+    book.close()
     return buf.getvalue()
 
 
@@ -1119,7 +1109,6 @@ def api_export():
         MAX(cs.status) AS status,
         MAX(cs.strategy) AS strategy,
         MAX(cs.placement) AS placement,
-        CAST(s.report_date AS date) AS report_date,
         SUM(s.sales) AS sales,
         SUM(s.expense) AS expense,
         SUM(s.views) AS views,
@@ -1128,30 +1117,31 @@ def api_export():
         SUM(s.model_orders) AS model_orders,
         SUM(s.model_sales) AS model_sales,
         MAX(s.weekly_budget) AS budget,
-        MAX(s.product_gmv) AS gmv,
+        SUM(s.product_gmv) AS gmv,
         MIN(s.date_added) AS date_added
     FROM src AS s
     INNER JOIN camp_status AS cs
         ON cs.sku = s.sku AND cs.campaign_id = s.campaign_id
     WHERE LTRIM(RTRIM(ISNULL(cs.status, N''))) IN ({status_ph})
-    GROUP BY s.sku, s.campaign_id, CAST(s.report_date AS date)
-    ORDER BY s.sku, CAST(s.report_date AS date), s.campaign_id;
+    GROUP BY s.sku, s.campaign_id
+    ORDER BY SUM(s.expense) DESC, s.sku, s.campaign_id;
     """
             with connect() as conn:
                 cur = conn.cursor()
                 cur.execute(sql, [*ctx["params"], *status_list])
                 raw = rows_dicts(cur)
             rows = pack_export_rows(raw)
-    filename = f"ozon-performance_{date_from.isoformat()}_{date_to.isoformat()}.xls"
-    payload = export_xls_bytes(EXPORT_HEADERS, rows)
+    filename = f"ozon-performance_{date_from.isoformat()}_{date_to.isoformat()}.xlsx"
+    payload = export_xlsx_bytes(EXPORT_HEADERS, rows)
     return Response(
         payload,
-        mimetype="application/vnd.ms-excel",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
             "X-Export-Rows": str(len(rows)),
         },
     )
+
 
 
 if __name__ == "__main__":
