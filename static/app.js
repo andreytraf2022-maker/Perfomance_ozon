@@ -405,7 +405,7 @@ function pickDay(id) {
   renderCal();
 }
 
-function applyPreset(kind) {
+function rangeForPreset(kind) {
   const today = clampIso(todayIso());
   let from = today;
   let to = today;
@@ -432,6 +432,11 @@ function applyPreset(kind) {
     to = clampIso(iso(end));
   }
   if (from > to) [from, to] = [to, from];
+  return { from, to };
+}
+
+function applyPreset(kind) {
+  const { from, to } = rangeForPreset(kind);
   state.draftFrom = from;
   state.draftTo = to;
   state.hover = null;
@@ -1610,6 +1615,121 @@ document.addEventListener("click", closeAllPops);
 window.addEventListener("resize", () => {
   syncHScroll();
   renderChart();
+});
+
+function filenameFromDisposition(header, fallback) {
+  if (!header) return fallback;
+  const star = /filename\*=UTF-8''([^;]+)/i.exec(header);
+  if (star) return decodeURIComponent(star[1]);
+  const plain = /filename="?([^";]+)"?/i.exec(header);
+  return plain ? plain[1] : fallback;
+}
+
+function syncExportDates() {
+  const fromEl = $("exportFrom");
+  const toEl = $("exportTo");
+  if (!fromEl || !toEl) return;
+  fromEl.min = state.minDate || "";
+  fromEl.max = state.maxDate || "";
+  toEl.min = state.minDate || "";
+  toEl.max = state.maxDate || "";
+  fromEl.value = state.exportFrom || state.from || state.maxDate || "";
+  toEl.value = state.exportTo || state.to || state.maxDate || "";
+}
+
+function openExportDlg() {
+  closeAllPops();
+  state.exportFrom = state.from || state.maxDate;
+  state.exportTo = state.to || state.maxDate;
+  syncExportDates();
+  const err = $("exportDlgErr");
+  if (err) {
+    err.hidden = true;
+    err.textContent = "";
+  }
+  $("exportDlg").hidden = false;
+}
+
+function closeExportDlg() {
+  $("exportDlg").hidden = true;
+}
+
+async function downloadExport() {
+  const fromEl = $("exportFrom");
+  const toEl = $("exportTo");
+  const err = $("exportDlgErr");
+  const go = $("exportDlgGo");
+  let from = clampIso(fromEl.value);
+  let to = clampIso(toEl.value);
+  if (!from || !to) {
+    err.hidden = false;
+    err.textContent = "Укажите период";
+    return;
+  }
+  if (from > to) [from, to] = [to, from];
+  fromEl.value = from;
+  toEl.value = to;
+  err.hidden = true;
+  go.disabled = true;
+  go.textContent = "Скачиваем…";
+  try {
+    const res = await fetch("/api/export", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...requestBody(), from, to }),
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let msg = `Ошибка ${res.status}`;
+      try {
+        const data = JSON.parse(text);
+        if (data && data.error) msg = data.error;
+      } catch {
+        if (text) msg = text;
+      }
+      throw new Error(msg);
+    }
+    const blob = await res.blob();
+    const name = filenameFromDisposition(
+      res.headers.get("Content-Disposition"),
+      `ozon-performance_${from}_${to}.csv`
+    );
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+    closeExportDlg();
+  } catch (e) {
+    err.hidden = false;
+    err.textContent = e.message || "Не удалось скачать файл";
+  } finally {
+    go.disabled = false;
+    go.textContent = "Скачать";
+  }
+}
+
+$("exportBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  openExportDlg();
+});
+$("exportDlg").addEventListener("click", (e) => e.stopPropagation());
+$("exportDlgBackdrop").addEventListener("click", closeExportDlg);
+$("exportDlgClose").addEventListener("click", closeExportDlg);
+$("exportDlgCancel").addEventListener("click", closeExportDlg);
+$("exportDlgGo").addEventListener("click", downloadExport);
+$("exportPresets").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-export-preset]");
+  if (!btn) return;
+  const { from, to } = rangeForPreset(btn.dataset.exportPreset);
+  $("exportFrom").value = from;
+  $("exportTo").value = to;
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !$("exportDlg").hidden) closeExportDlg();
 });
 
 const tableScroll = $("tableScroll");

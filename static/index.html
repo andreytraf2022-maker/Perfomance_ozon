@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OZON Performance — товары</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/app.css?v=18">
+  <link rel="stylesheet" href="/static/app.css?v=19">
 </head>
 <body>
   <header class="top">
@@ -264,6 +264,7 @@
         <button type="button" class="btn" id="apply">Показать</button>
         <span class="spinner" id="spinner" hidden></span>
         <button type="button" class="btn btn--ghost" id="reset">Сбросить</button>
+        <button type="button" class="btn btn--ghost" id="exportBtn">Скачать</button>
       </div>
     </div>
   </section>
@@ -355,6 +356,37 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=18"></script>
+  <div class="dlg" id="exportDlg" hidden>
+    <div class="dlg__backdrop" id="exportDlgBackdrop"></div>
+    <div class="dlg__card" role="dialog" aria-modal="true" aria-labelledby="exportDlgTitle">
+      <div class="dlg__head">
+        <h2 id="exportDlgTitle">Скачать отчёт</h2>
+        <button type="button" class="dlg__x" id="exportDlgClose" aria-label="Закрыть">×</button>
+      </div>
+      <p class="dlg__lead">Выберите период. В файле будет каждый день: строка по товару и отдельные строки по каждой кампании со всеми показателями. Остальные фильтры кабинета сохраняются.</p>
+      <div class="field">
+        <span>Период</span>
+        <div class="export-dates">
+          <input type="date" id="exportFrom">
+          <span class="export-dates__sep">—</span>
+          <input type="date" id="exportTo">
+        </div>
+      </div>
+      <div class="export-presets" id="exportPresets">
+        <button type="button" data-export-preset="today">Сегодня</button>
+        <button type="button" data-export-preset="yesterday">Вчера</button>
+        <button type="button" data-export-preset="7d">За 7 дней</button>
+        <button type="button" data-export-preset="month">Текущий месяц</button>
+        <button type="button" data-export-preset="prev-month">Прошедший месяц</button>
+      </div>
+      <div class="dlg__err" id="exportDlgErr" hidden></div>
+      <div class="dlg__actions">
+        <button type="button" class="btn btn--ghost" id="exportDlgCancel">Отмена</button>
+        <button type="button" class="btn" id="exportDlgGo">Скачать</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=19"></script>
 </body>
 </html>

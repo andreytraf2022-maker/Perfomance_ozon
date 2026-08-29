@@ -605,3 +605,58 @@ def _points_from_days_demo(days, by_date):
             }
         )
     return out
+
+
+def export_raw(date_from, date_to, filters):
+    payload = products(date_from, date_to, filters)
+    days = []
+    if date_from and date_to:
+        cur = date_from
+        while cur <= date_to:
+            days.append(cur)
+            cur += timedelta(days=1)
+    add_keys = (
+        "sales",
+        "expense",
+        "views",
+        "clicks",
+        "to_cart",
+        "model_orders",
+        "model_sales",
+        "budget",
+        "gmv",
+    )
+    raw = []
+    for pi, item in enumerate(payload["items"]):
+        camps = [c for key in item["campaigns"] for c in item["campaigns"][key]]
+        gmv_daily = _distribute(item.get("gmv") or 0, _day_weights(days, pi * 0.4))
+        for ci, camp in enumerate(camps):
+            weights = _day_weights(days, pi * 0.7 + ci * 0.33)
+            vals = {k: _distribute(camp.get(k) or 0, weights) for k in add_keys if k != "gmv"}
+            for i, d in enumerate(days):
+                raw.append(
+                    {
+                        "sku": item["sku"],
+                        "campaign_id": camp["id"],
+                        "campaign_name": camp["name"],
+                        "nom_name": item["name"],
+                        "artic": item.get("artic"),
+                        "code": item.get("code"),
+                        "manager": item.get("manager"),
+                        "status": camp.get("status"),
+                        "strategy": camp.get("strategy"),
+                        "placement": camp.get("placement"),
+                        "report_date": d,
+                        "sales": vals["sales"][i],
+                        "expense": vals["expense"][i],
+                        "views": vals["views"][i],
+                        "clicks": vals["clicks"][i],
+                        "to_cart": vals["to_cart"][i],
+                        "model_orders": vals["model_orders"][i],
+                        "model_sales": vals["model_sales"][i],
+                        "budget": vals["budget"][i],
+                        "gmv": gmv_daily[i],
+                        "date_added": camp.get("date_added"),
+                    }
+                )
+    return raw

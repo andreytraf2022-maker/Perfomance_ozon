@@ -1,13 +1,17 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import csv
+import io
 import os
 import re
+from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
+from urllib.parse import quote
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request, send_from_directory
 
 import demo
 
@@ -884,6 +888,228 @@ def api_chart():
             "to": date_to.isoformat(),
             "series": pack_chart_series(date_from, date_to, raw),
         }
+    )
+
+
+EXPORT_HEADERS = [
+    "Дата",
+    "Тип",
+    "SKU",
+    "Артикул",
+    "Код",
+    "Наименование",
+    "Менеджер",
+    "ID кампании",
+    "Кампания",
+    "Статус",
+    "Стратегия",
+    "Размещение",
+    "Бюджет РК, ₽",
+    "Всего заказано, ₽",
+    "Заказано по рек., ₽",
+    "Расход, ₽",
+    "ДРР по рекл., %",
+    "ДРР общий, %",
+    "Показы",
+    "Клики",
+    "CPC",
+    "CTR",
+    "Добавлено в корзину",
+    "Модельные заказы",
+    "Модельные продажи, ₽",
+    "Дата добавления товара",
+]
+
+
+def _csv_num(v, nd=2):
+    if v is None:
+        return ""
+    n = float(v)
+    if nd == 0:
+        return str(int(round(n)))
+    s = f"{n:.{nd}f}".rstrip("0").rstrip(".")
+    return s.replace(".", ",")
+
+
+def _csv_date(v):
+    if not v:
+        return ""
+    if hasattr(v, "strftime"):
+        return v.strftime("%d.%m.%Y")
+    s = str(v)[:10]
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").strftime("%d.%m.%Y")
+    except ValueError:
+        return s
+
+
+def _export_line(kind, day, meta, metrics, camp=None):
+    sales = num(metrics.get("sales"))
+    expense = num(metrics.get("expense"))
+    views = num(metrics.get("views"))
+    clicks = num(metrics.get("clicks"))
+    gmv = metrics.get("gmv")
+    gmv_n = None if gmv is None else num(gmv)
+    drr = ratio(expense, sales)
+    general_drr = ratio(expense, gmv_n)
+    ctr = ratio(clicks, views)
+    cpc = unit_price(expense, clicks)
+    camp = camp or {}
+    return [
+        _csv_date(day),
+        kind,
+        meta.get("sku") or "",
+        meta.get("artic") or "",
+        meta.get("code") or "",
+        meta.get("name") or "",
+        meta.get("manager") or "",
+        camp.get("id") or "",
+        camp.get("name") or "",
+        camp.get("status") or "",
+        camp.get("strategy") or "",
+        camp.get("placement") or "",
+        _csv_num(metrics.get("budget")),
+        _csv_num(gmv_n),
+        _csv_num(sales),
+        _csv_num(expense),
+        "" if drr is None else _csv_num(drr, 1),
+        "" if general_drr is None else _csv_num(general_drr, 1),
+        _csv_num(views, 0),
+        _csv_num(clicks, 0),
+        "" if cpc is None else _csv_num(cpc),
+        "" if ctr is None else _csv_num(ctr, 1),
+        _csv_num(metrics.get("to_cart"), 0),
+        _csv_num(metrics.get("model_orders"), 0),
+        _csv_num(metrics.get("model_sales")),
+        _csv_date(meta.get("date_added") if kind == "Товар" else camp.get("date_added")),
+    ]
+
+
+def pack_export_rows(raw):
+    groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    sku_meta: dict[str, dict] = {}
+    for row in raw:
+        sku = str(row.get("sku") or "").strip()
+        camp_id = str(row.get("campaign_id") or "").strip()
+        if not sku or not camp_id:
+            continue
+        day = row.get("report_date")
+        day_s = day.isoformat()[:10] if hasattr(day, "isoformat") else str(day)[:10]
+        groups[(sku, day_s)].append(row)
+        prev = sku_meta.get(sku) or {}
+        sku_meta[sku] = {
+            "sku": sku,
+            "name": row.get("nom_name") or prev.get("name") or sku,
+            "artic": row.get("artic") or prev.get("artic"),
+            "code": row.get("code") or prev.get("code"),
+            "manager": row.get("manager") or prev.get("manager"),
+            "date_added": row.get("date_added") or prev.get("date_added"),
+            "expense": num(prev.get("expense")) + num(row.get("expense")),
+        }
+
+    sku_order = sorted(sku_meta, key=lambda s: -sku_meta[s]["expense"])
+    rows = []
+    for sku in sku_order:
+        days = sorted({day for s, day in groups if s == sku})
+        meta = sku_meta[sku]
+        for day_s in days:
+            camps = groups[(sku, day_s)]
+            acc = {
+                "sales": 0.0,
+                "expense": 0.0,
+                "views": 0.0,
+                "clicks": 0.0,
+                "to_cart": 0.0,
+                "model_orders": 0.0,
+                "model_sales": 0.0,
+                "budget": 0.0,
+                "gmv": 0.0,
+            }
+            for c in camps:
+                _add_into(acc, c, gmv="max")
+            rows.append(_export_line("Товар", day_s, meta, acc))
+            for c in sorted(camps, key=lambda x: str(x.get("campaign_id") or "")):
+                camp = {
+                    "id": str(c.get("campaign_id") or ""),
+                    "name": c.get("campaign_name") or c.get("campaign_id"),
+                    "status": (c.get("status") or "").strip(),
+                    "strategy": (c.get("strategy") or "").strip(),
+                    "placement": (c.get("placement") or "").strip(),
+                    "date_added": c.get("date_added"),
+                }
+                rows.append(_export_line("Кампания", day_s, meta, c, camp))
+    return rows
+
+
+def export_csv_bytes(headers, rows):
+    buf = io.StringIO()
+    buf.write("\ufeff")
+    writer = csv.writer(buf, delimiter=";", lineterminator="\n")
+    writer.writerow(headers)
+    writer.writerows(rows)
+    return buf.getvalue().encode("utf-8")
+
+
+@app.post("/api/export")
+def api_export():
+    ctx = parse_report_request()
+    date_from = ctx["date_from"]
+    date_to = ctx["date_to"]
+    if not date_from or not date_to:
+        return jsonify({"error": "Укажите период"}), 400
+    if demo_mode():
+        rows = pack_export_rows(demo.export_raw(date_from, date_to, ctx["filters"]))
+    else:
+        status_set = ctx["status_set"]
+        if not status_set:
+            rows = []
+        else:
+            status_list = list(status_set)
+            status_ph = ",".join("?" * len(status_list))
+            sql = SRC_CTE.format(extra_sql=ctx["extra_sql"]).rstrip() + f"""
+    SELECT
+        s.sku,
+        s.campaign_id,
+        MAX(s.campaign_name) AS campaign_name,
+        MAX(s.nom_name) AS nom_name,
+        MAX(s.artic) AS artic,
+        MAX(s.code) AS code,
+        MAX(s.manager) AS manager,
+        MAX(cs.status) AS status,
+        MAX(cs.strategy) AS strategy,
+        MAX(cs.placement) AS placement,
+        CAST(s.report_date AS date) AS report_date,
+        SUM(s.sales) AS sales,
+        SUM(s.expense) AS expense,
+        SUM(s.views) AS views,
+        SUM(s.clicks) AS clicks,
+        SUM(s.to_cart) AS to_cart,
+        SUM(s.model_orders) AS model_orders,
+        SUM(s.model_sales) AS model_sales,
+        MAX(s.weekly_budget) AS budget,
+        MAX(s.product_gmv) AS gmv,
+        MIN(s.date_added) AS date_added
+    FROM src AS s
+    INNER JOIN camp_status AS cs
+        ON cs.sku = s.sku AND cs.campaign_id = s.campaign_id
+    WHERE LTRIM(RTRIM(ISNULL(cs.status, N''))) IN ({status_ph})
+    GROUP BY s.sku, s.campaign_id, CAST(s.report_date AS date)
+    ORDER BY s.sku, CAST(s.report_date AS date), s.campaign_id;
+    """
+            with connect() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, [*ctx["params"], *status_list])
+                raw = rows_dicts(cur)
+            rows = pack_export_rows(raw)
+    filename = f"ozon-performance_{date_from.isoformat()}_{date_to.isoformat()}.csv"
+    payload = export_csv_bytes(EXPORT_HEADERS, rows)
+    return Response(
+        payload,
+        mimetype="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "X-Export-Rows": str(len(rows)),
+        },
     )
 
 
