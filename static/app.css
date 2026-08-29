@@ -703,6 +703,37 @@ a.camp-id:hover {
 
 .col-m { text-align: center; }
 
+.sort-btn {
+  display: inline-flex;
+  align-items: flex-end;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  text-align: center;
+  cursor: pointer;
+  line-height: 1.25;
+}
+
+.sort-btn:hover { color: var(--ink); }
+
+.col-m.is-sorted .sort-btn { color: var(--ink); }
+
+.sort-ico {
+  flex: none;
+  font-size: 9px;
+  color: #c5cad3;
+  transform: translateY(-1px);
+}
+
+.col-m.is-sorted .sort-ico { color: var(--blue); }
+
 .prod-row {
   border-bottom: 1px solid var(--line);
   cursor: default;

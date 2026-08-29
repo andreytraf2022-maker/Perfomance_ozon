@@ -12,20 +12,20 @@ const CAMP_KEYS = ["active", "planned", "paused", "inactive", "done", "other"];
 const CHECK_FIELDS = ["artic", "code", "nom", "manager", "sku", "campaign"];
 const COLS_KEY = "ozon-ads-table-cols";
 const METRIC_COLS = [
+  { id: "budget", label: "Бюджет РК, ₽", kind: "money" },
+  { id: "gmv", label: "Всего заказано, ₽", kind: "money" },
   { id: "sales", label: "Заказано по рек., ₽", kind: "money" },
   { id: "expense", label: "Расход, ₽", kind: "money" },
   { id: "drr", label: "ДРР по рекл., %", kind: "pct" },
   { id: "general_drr", label: "ДРР общий, %", kind: "pct" },
   { id: "views", label: "Показы", kind: "int" },
   { id: "clicks", label: "Клики", kind: "int" },
-  { id: "budget", label: "Бюджет РК, ₽", kind: "money" },
-  { id: "ctr", label: "CTR", kind: "pct" },
   { id: "cpc", label: "CPC", kind: "money" },
-  { id: "gmv", label: "Всего заказано, ₽", kind: "money" },
-  { id: "date_added", label: "Дата добавления товара", kind: "date" },
+  { id: "ctr", label: "CTR", kind: "pct" },
   { id: "to_cart", label: "Добавлено в корзину", kind: "int" },
   { id: "model_orders", label: "Модельные заказы", kind: "int" },
   { id: "model_sales", label: "Модельные продажи, ₽", kind: "money" },
+  { id: "date_added", label: "Дата добавления товара", kind: "date" },
 ];
 const STATUS_DOTS = [
   { key: "active", tone: "on", title: "Активна" },
@@ -127,6 +127,7 @@ const state = {
   page: 1,
   pageSize: 50,
   cols: loadCols(),
+  sort: { id: "expense", dir: "desc" },
   chartGrain: "week",
   chartExpanded: false,
   chartOn: new Set([TOTAL_CHART_ID]),
@@ -192,8 +193,12 @@ function renderMetricHead() {
   wrap.querySelectorAll(".col-m").forEach((el) => el.remove());
   for (const col of visibleCols()) {
     const d = document.createElement("div");
-    d.className = "col-m";
-    d.textContent = col.label;
+    const on = state.sort.id === col.id;
+    d.className = `col-m${on ? " is-sorted" : ""}`;
+    d.innerHTML = `<button type="button" class="sort-btn" data-sort="${esc(col.id)}" title="Сортировать: сначала большее">
+      <span>${esc(col.label)}</span>
+      <span class="sort-ico" aria-hidden="true">${on ? (state.sort.dir === "desc" ? "▼" : "▲") : "▼"}</span>
+    </button>`;
     wrap.appendChild(d);
   }
   $("tableWrap").style.setProperty("--mc", String(visibleCols().length));
@@ -982,25 +987,50 @@ function campCount(items) {
   return items.reduce((n, p) => n + CAMP_KEYS.reduce((m, k) => m + (p.campaigns[k] || []).length, 0), 0);
 }
 
+function sortValue(row, col) {
+  const v = row?.[col.id];
+  if (v === null || v === undefined || v === "") return null;
+  if (col.kind === "date") return String(v).slice(0, 10);
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+function cmpSort(a, b, dir) {
+  if (a == null && b == null) return 0;
+  if (a == null) return 1;
+  if (b == null) return -1;
+  if (a === b) return 0;
+  if (dir === "desc") return a < b ? 1 : -1;
+  return a < b ? -1 : 1;
+}
+
+function sortRows(rows) {
+  const col = METRIC_COLS.find((c) => c.id === state.sort.id);
+  if (!col) return rows;
+  return [...rows].sort((a, b) => cmpSort(sortValue(a, col), sortValue(b, col), state.sort.dir));
+}
+
 function filteredItems() {
   const items = state.data?.items || [];
   const q = state.search.trim().toLowerCase();
-  if (!q) return items;
-  return items.filter((p) => {
-    const camps = CAMP_KEYS.flatMap((k) => p.campaigns[k] || []);
-    const blob = [
-      p.name,
-      p.artic,
-      p.code,
-      p.sku,
-      ...camps.map((c) => c.name),
-      ...camps.map((c) => c.id),
-    ]
-      .filter(Boolean)
-      .join(" ")
-      .toLowerCase();
-    return blob.includes(q);
-  });
+  const filtered = q
+    ? items.filter((p) => {
+        const camps = CAMP_KEYS.flatMap((k) => p.campaigns[k] || []);
+        const blob = [
+          p.name,
+          p.artic,
+          p.code,
+          p.sku,
+          ...camps.map((c) => c.name),
+          ...camps.map((c) => c.id),
+        ]
+          .filter(Boolean)
+          .join(" ")
+          .toLowerCase();
+        return blob.includes(q);
+      })
+    : items;
+  return sortRows(filtered);
 }
 
 function campRow(c, pillClassName, pillText, sku) {
@@ -1028,7 +1058,8 @@ function campRow(c, pillClassName, pillText, sku) {
 function campsHtml(p) {
   const rows = [];
   for (const [key, cls, text] of CAMP_ORDER) {
-    for (const c of p.campaigns[key] || []) {
+    const camps = sortRows(p.campaigns[key] || []);
+    for (const c of camps) {
       rows.push(campRow(c, cls, text, p.sku));
     }
   }
@@ -1405,6 +1436,20 @@ $("chartMetricsItems").addEventListener("change", (e) => {
   state.chartMetric = t.dataset.chartMetric;
   saveChartMetric();
   renderChart();
+});
+
+$("headRow").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-sort]");
+  if (!btn) return;
+  e.stopPropagation();
+  const id = btn.dataset.sort;
+  if (state.sort.id === id) state.sort.dir = state.sort.dir === "desc" ? "asc" : "desc";
+  else {
+    state.sort.id = id;
+    state.sort.dir = "desc";
+  }
+  state.page = 1;
+  render();
 });
 
 $("tableSearch").addEventListener("input", () => {
