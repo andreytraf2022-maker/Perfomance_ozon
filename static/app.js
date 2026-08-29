@@ -48,6 +48,8 @@ const TOTAL_CHART_ID = "total";
 const CHART_COLORS = ["#005bff", "#16a34a", "#f59e0b", "#7c3aed", "#dc2626", "#0891b2", "#db2777", "#0f766e"];
 const CHART_METRICS = METRIC_COLS.filter((c) => c.kind !== "date");
 const CHART_METRICS_KEY = "ozon-ads-chart-metrics";
+const CHART_COMBO = new Set(["gmv", "sales", "expense", "model_sales"]);
+const CHART_DASH = { gmv: "", sales: "6 4", expense: "2 4", model_sales: "8 3 2 3" };
 const CHART_ADD = ["sales", "expense", "views", "clicks", "to_cart", "model_orders", "model_sales", "budget", "gmv"];
 
 const CHECK_LABELS = {
@@ -74,18 +76,35 @@ const emptyLists = () => ({
   campaign: [],
 });
 
-function loadChartMetric() {
+function isChartCombo(id) {
+  return CHART_COMBO.has(id);
+}
+
+function knownChartMetricIds(ids) {
+  const allow = new Set(CHART_METRICS.map((c) => c.id));
+  return [...new Set((ids || []).filter((id) => allow.has(id)))];
+}
+
+function normalizeChartMetrics(ids) {
+  const uniq = knownChartMetricIds(ids);
+  if (!uniq.length) return ["expense"];
+  if (uniq.length === 1) return uniq;
+  if (uniq.every(isChartCombo)) return uniq;
+  return [uniq[0]];
+}
+
+function loadChartMetrics() {
   try {
     const raw = JSON.parse(localStorage.getItem(CHART_METRICS_KEY) || "null");
-    if (typeof raw === "string" && CHART_METRICS.some((c) => c.id === raw)) return raw;
+    if (typeof raw === "string") return normalizeChartMetrics([raw]);
+    if (Array.isArray(raw)) return normalizeChartMetrics(raw);
     if (raw && typeof raw === "object") {
-      const found = CHART_METRICS.find((c) => raw[c.id]);
-      if (found) return found.id;
+      return normalizeChartMetrics(CHART_METRICS.filter((c) => raw[c.id]).map((c) => c.id));
     }
   } catch {
     /* keep default */
   }
-  return "expense";
+  return ["expense"];
 }
 
 function loadCols() {
@@ -132,7 +151,7 @@ const state = {
   chartExpanded: false,
   chartOn: new Set([TOTAL_CHART_ID]),
   chartData: null,
-  chartMetric: loadChartMetric(),
+  chartMetrics: loadChartMetrics(),
 };
 
 const esc = (s) =>
@@ -789,40 +808,94 @@ function fmtAxisDate(s) {
   return `${d.getDate()}, ${wd}`;
 }
 
-function currentChartMetric() {
-  return CHART_METRICS.find((c) => c.id === state.chartMetric) || CHART_METRICS.find((c) => c.id === "expense");
+function selectedChartMetrics() {
+  const ids = normalizeChartMetrics(state.chartMetrics);
+  if (ids.join() !== state.chartMetrics.join()) state.chartMetrics = ids;
+  return ids
+    .map((id) => CHART_METRICS.find((c) => c.id === id))
+    .filter(Boolean);
 }
 
-function saveChartMetric() {
-  localStorage.setItem(CHART_METRICS_KEY, JSON.stringify(state.chartMetric));
+function shortMetricLabel(col) {
+  return (col?.label || "").replace(/, ₽$/, "").replace(/, %$/, "");
+}
+
+function metricLineColor(id) {
+  const i = CHART_METRICS.findIndex((c) => c.id === id);
+  return CHART_COLORS[(i < 0 ? 0 : i) % CHART_COLORS.length];
+}
+
+function saveChartMetrics() {
+  localStorage.setItem(CHART_METRICS_KEY, JSON.stringify(state.chartMetrics));
+}
+
+function applyChartMetric(id, wantOn) {
+  const cur = [...state.chartMetrics];
+  if (wantOn) {
+    if (cur.includes(id)) return;
+    if (!isChartCombo(id) || (cur.length && !cur.every(isChartCombo))) {
+      state.chartMetrics = [id];
+      return;
+    }
+    state.chartMetrics = [...cur, id];
+    return;
+  }
+  if (cur.length <= 1 || !cur.includes(id)) return;
+  state.chartMetrics = cur.filter((x) => x !== id);
 }
 
 function renderChartMetricsItems() {
   const box = $("chartMetricsItems");
   if (!box) return;
+  const on = new Set(state.chartMetrics);
   box.innerHTML = CHART_METRICS.map(
     (c) => `
     <label>
-      <input type="radio" name="chartMetric" data-chart-metric="${c.id}" ${state.chartMetric === c.id ? "checked" : ""}>
+      <input type="checkbox" data-chart-metric="${c.id}" ${on.has(c.id) ? "checked" : ""}>
       <span>${esc(c.label)}</span>
     </label>`
   ).join("");
 }
 
 function visibleChartSeries() {
-  const metric = currentChartMetric();
-  if (!metric) return [];
+  const metrics = selectedChartMetrics();
+  if (!metrics.length) return [];
   const entities = (state.chartData?.series || []).filter((s) => state.chartOn.has(s.id));
-  return entities.map((ent, i) => ({
-    entityId: ent.id,
-    name: ent.name,
-    metric,
-    color: CHART_COLORS[i % CHART_COLORS.length],
-    points: bucketMetric(ent.points, metric.id, state.chartGrain).map((p) => ({
-      ...p,
-      label: fmtAxisDate(p.date),
-    })),
-  }));
+  const splitExpense = metrics.some((m) => m.id === "expense") && metrics.some((m) => m.id !== "expense");
+  const colorByMetric = metrics.length > 1 && entities.length <= 1;
+  const out = [];
+  entities.forEach((ent, i) => {
+    const entityColor = CHART_COLORS[i % CHART_COLORS.length];
+    metrics.forEach((metric) => {
+      out.push({
+        entityId: ent.id,
+        name: ent.name,
+        metric,
+        axis: splitExpense && metric.id === "expense" ? 1 : 0,
+        dash: metrics.length > 1 && !colorByMetric ? CHART_DASH[metric.id] || "6 4" : "",
+        color: colorByMetric ? metricLineColor(metric.id) : entityColor,
+        points: bucketMetric(ent.points, metric.id, state.chartGrain).map((p) => ({
+          ...p,
+          label: fmtAxisDate(p.date),
+        })),
+      });
+    });
+  });
+  return out;
+}
+
+function legendTitle(s, metrics, entities) {
+  if (metrics.length <= 1) return s.name;
+  if (entities <= 1) return shortMetricLabel(s.metric);
+  return `${s.name} · ${shortMetricLabel(s.metric)}`;
+}
+
+function tipTitle(s, metrics, entities) {
+  if (metrics.length <= 1) {
+    return entities <= 1 ? shortMetricLabel(s.metric) : s.name;
+  }
+  if (entities <= 1) return shortMetricLabel(s.metric);
+  return `${s.name} · ${shortMetricLabel(s.metric)}`;
 }
 
 function renderChart() {
@@ -831,6 +904,7 @@ function renderChart() {
   const legend = $("chartLegend");
   const empty = $("chartEmpty");
   const yLabel = $("chartYLabel");
+  const yLabelR = $("chartYLabelRight");
   const tip = $("chartTip");
   if (!card || !svgBox) return;
   if (!state.chartData) {
@@ -844,9 +918,21 @@ function renderChart() {
     btn.classList.toggle("is-on", btn.dataset.grain === state.chartGrain);
   });
 
+  const metrics = selectedChartMetrics();
   const series = visibleChartSeries();
-  const metric = currentChartMetric();
-  if (yLabel) yLabel.textContent = metric ? metric.label : "Расход, ₽";
+  const entityCount = new Set(series.map((s) => s.entityId)).size;
+  const splitExpense = metrics.some((m) => m.id === "expense") && metrics.some((m) => m.id !== "expense");
+  const leftMetrics = splitExpense ? metrics.filter((m) => m.id !== "expense") : metrics;
+  const leftKind = (leftMetrics[0] || metrics[0] || { kind: "money" }).kind;
+  const rightKind = "money";
+  if (yLabel) {
+    yLabel.textContent =
+      leftMetrics.length === 1 ? leftMetrics[0].label : leftMetrics.length ? "₽" : metrics[0]?.label || "Расход, ₽";
+  }
+  if (yLabelR) {
+    yLabelR.hidden = !splitExpense;
+    yLabelR.textContent = splitExpense ? "Расход, ₽" : "";
+  }
   if (!series.length || series.every((s) => !s.points.length)) {
     svgBox.innerHTML = "";
     legend.innerHTML = "";
@@ -857,7 +943,7 @@ function renderChart() {
   legend.innerHTML = series
     .map(
       (s) => `<span class="chart-legend__item" style="color:${s.color}">
-        <span class="chart-legend__dot"></span>${esc(s.name)}
+        <span class="chart-legend__dot${s.dash ? " is-dash" : ""}"></span>${esc(legendTitle(s, metrics, entityCount))}
       </span>`
     )
     .join("");
@@ -866,23 +952,31 @@ function renderChart() {
   const dates = series[0].points.map((p) => p.date);
   const n = labels.length;
   const dayMode = state.chartGrain === "day";
-  const maxL = niceMax(Math.max(0, ...series.flatMap((s) => s.points.map((p) => p.value))));
+  const leftVals = series.filter((s) => s.axis !== 1).flatMap((s) => s.points.map((p) => p.value));
+  const rightVals = series.filter((s) => s.axis === 1).flatMap((s) => s.points.map((p) => p.value));
+  const maxL = niceMax(Math.max(0, ...(leftVals.length ? leftVals : [0])));
+  const maxR = niceMax(Math.max(0, ...(rightVals.length ? rightVals : [0])));
   const boxW = Math.max(svgBox.clientWidth || 480, 280);
   const h = svgBox.clientHeight || 260;
-  const pad = { l: 44, r: 12, t: 22, b: dayMode ? 36 : 28 };
+  const pad = { l: 44, r: splitExpense ? 48 : 12, t: 22, b: dayMode ? 36 : 28 };
   const minInner = dayMode ? Math.max(n * 28, 80) : 80;
   const w = Math.max(boxW, pad.l + minInner + pad.r);
   const innerW = Math.max(1, w - pad.l - pad.r);
   const innerH = Math.max(1, h - pad.t - pad.b);
   const xAt = (i) => pad.l + (n <= 1 ? innerW / 2 : (i / (n - 1)) * innerW);
-  const yAt = (v) => pad.t + innerH - (v / maxL) * innerH;
+  const yAtAxis = (v, max) => pad.t + innerH - (v / max) * innerH;
+  const yAt = (s, v) => yAtAxis(v, s.axis === 1 ? maxR : maxL);
 
   let grid = "";
   for (let i = 0; i <= 3; i += 1) {
-    const v = (maxL * (3 - i)) / 3;
-    const y = yAt(v);
+    const vL = (maxL * (3 - i)) / 3;
+    const y = yAtAxis(vL, maxL);
     grid += `<line x1="${pad.l}" x2="${w - pad.r}" y1="${y}" y2="${y}" stroke="#eef2f6" stroke-width="1"/>`;
-    grid += `<text x="${pad.l - 6}" y="${y + 3}" text-anchor="end" fill="#98a2b3" font-size="11">${esc(fmtAxis(v, metric.kind))}</text>`;
+    grid += `<text x="${pad.l - 6}" y="${y + 3}" text-anchor="end" fill="#98a2b3" font-size="11">${esc(fmtAxis(vL, leftKind))}</text>`;
+    if (splitExpense) {
+      const vR = (maxR * (3 - i)) / 3;
+      grid += `<text x="${w - pad.r + 6}" y="${y + 3}" text-anchor="start" fill="#98a2b3" font-size="11">${esc(fmtAxis(vR, rightKind))}</text>`;
+    }
   }
   let xLabels = "";
   labels.forEach((lab, i) => {
@@ -894,8 +988,9 @@ function renderChart() {
   });
   const lines = series
     .map((s) => {
-      const d = s.points.map((p, i) => `${i ? "L" : "M"}${xAt(i)} ${yAt(p.value)}`).join(" ");
-      return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      const d = s.points.map((p, i) => `${i ? "L" : "M"}${xAt(i)} ${yAt(s, p.value)}`).join(" ");
+      const dash = s.dash ? ` stroke-dasharray="${s.dash}"` : "";
+      return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"${dash}/>`;
     })
     .join("");
   svgBox.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img">
@@ -931,23 +1026,20 @@ function renderChart() {
     vLine.setAttribute("y2", String(pad.t + innerH));
     dots.innerHTML = series
       .map((s) => {
-        const cy = yAt(s.points[idx]?.value || 0);
+        const cy = yAt(s, s.points[idx]?.value || 0);
         return `<circle cx="${cx}" cy="${cy}" r="5" fill="#fff" stroke="${s.color}" stroke-width="2"/>`;
       })
       .join("");
     const valueRows = series
       .map((s) => {
         const val = fmtChartVal(s.metric, s.points[idx]?.value);
-        if (series.length === 1) {
-          return `<div class="chart-tip__row"><span>${esc(metric.label.replace(/, ₽$/, "").replace(/, %$/, ""))}</span><b>${val}</b></div>`;
-        }
-        return `<div class="chart-tip__row"><span>${esc(s.name)}</span><b>${val}</b></div>`;
+        return `<div class="chart-tip__row"><span>${esc(tipTitle(s, metrics, entityCount))}</span><b>${val}</b></div>`;
       })
       .join("");
     tip.hidden = false;
     tip.innerHTML = `<div class="chart-tip__date">${esc(fmtLongDate(dates[idx]))}</div>${valueRows}`;
     const box = svgBox.getBoundingClientRect();
-    const left = Math.min(box.width - 220, Math.max(8, ev.clientX - box.left + 14));
+    const left = Math.min(box.width - 240, Math.max(8, ev.clientX - box.left + 14));
     tip.style.left = `${left}px`;
     tip.style.top = `28px`;
   };
@@ -1433,8 +1525,9 @@ $("colsItems").addEventListener("change", (e) => {
 $("chartMetricsItems").addEventListener("change", (e) => {
   const t = e.target;
   if (!t.matches("input[data-chart-metric]")) return;
-  state.chartMetric = t.dataset.chartMetric;
-  saveChartMetric();
+  applyChartMetric(t.dataset.chartMetric, t.checked);
+  saveChartMetrics();
+  renderChartMetricsItems();
   renderChart();
 });
 
