@@ -46,6 +46,9 @@ const CAMP_ORDER = [
 const GROUP_FIELDS = ["g1", "g2", "g3"];
 const TOTAL_CHART_ID = "total";
 const CHART_COLORS = ["#005bff", "#16a34a", "#f59e0b", "#7c3aed", "#dc2626", "#0891b2", "#db2777", "#0f766e"];
+const CHART_METRICS = METRIC_COLS.filter((c) => c.kind !== "date");
+const CHART_METRICS_KEY = "ozon-ads-chart-metrics";
+const CHART_ADD = ["sales", "expense", "views", "clicks", "to_cart", "model_orders", "model_sales", "budget", "gmv"];
 
 const CHECK_LABELS = {
   artic: { empty: "Артикул", chip: "Артикул" },
@@ -70,6 +73,22 @@ const emptyLists = () => ({
   sku: [],
   campaign: [],
 });
+
+function loadChartMetrics() {
+  const all = Object.fromEntries(CHART_METRICS.map((c) => [c.id, c.id === "expense"]));
+  try {
+    const raw = JSON.parse(localStorage.getItem(CHART_METRICS_KEY) || "null");
+    if (raw && typeof raw === "object") {
+      for (const c of CHART_METRICS) {
+        if (typeof raw[c.id] === "boolean") all[c.id] = raw[c.id];
+      }
+    }
+  } catch {
+    /* keep defaults */
+  }
+  if (!CHART_METRICS.some((c) => all[c.id])) all.expense = true;
+  return all;
+}
 
 function loadCols() {
   const all = Object.fromEntries(METRIC_COLS.map((c) => [c.id, true]));
@@ -114,6 +133,7 @@ const state = {
   chartExpanded: false,
   chartOn: new Set([TOTAL_CHART_ID]),
   chartData: null,
+  chartMetrics: loadChartMetrics(),
 };
 
 const esc = (s) =>
@@ -415,6 +435,13 @@ function closeColsPop() {
   $("colsWrap").classList.remove("open");
 }
 
+function closeChartMetricsPop() {
+  const pop = $("chartMetricsPop");
+  const wrap = $("chartMetricsWrap");
+  if (pop) pop.hidden = true;
+  if (wrap) wrap.classList.remove("open");
+}
+
 function closeStatusPop() {
   $("statusPop").hidden = true;
   $("statusWrap").classList.remove("open");
@@ -452,6 +479,7 @@ function closeAllPops() {
   closeStatusPop();
   closeCheckPops();
   closeColsPop();
+  closeChartMetricsPop();
   closePageSize();
 }
 
@@ -644,6 +672,10 @@ function setManagers(names) {
   state.lists.manager = cloneChecks(items);
 }
 
+function campChartId(sku, campaignId) {
+  return `camp:${sku}:${campaignId}`;
+}
+
 function eyeBtn(id) {
   const on = state.chartOn.has(id);
   return `<button type="button" class="eye-btn${on ? " is-on" : ""}" data-chart-id="${esc(id)}" title="${on ? "Убрать с графика" : "Показать на графике"}" aria-pressed="${on ? "true" : "false"}" aria-label="На графике">
@@ -666,19 +698,57 @@ function fmtShort(s) {
   return `${String(d.getDate()).padStart(2, "0")}.${String(d.getMonth() + 1).padStart(2, "0")}`;
 }
 
-function bucketPoints(points, grain) {
+function ratioNum(a, b) {
+  const den = Number(b) || 0;
+  if (!den) return 0;
+  return (Number(a) || 0) / den * 100;
+}
+
+function unitNum(a, b) {
+  const den = Number(b) || 0;
+  if (!den) return 0;
+  return (Number(a) || 0) / den;
+}
+
+function metricFromAcc(acc, metricId) {
+  if (metricId === "drr") return ratioNum(acc.expense, acc.sales);
+  if (metricId === "general_drr") return ratioNum(acc.expense, acc.gmv);
+  if (metricId === "ctr") return ratioNum(acc.clicks, acc.views);
+  if (metricId === "cpc") return unitNum(acc.expense, acc.clicks);
+  return Number(acc[metricId]) || 0;
+}
+
+function blankAcc() {
+  return Object.fromEntries(CHART_ADD.map((k) => [k, 0]));
+}
+
+function addAcc(dst, src) {
+  for (const k of CHART_ADD) dst[k] += Number(src[k]) || 0;
+}
+
+function bucketMetric(points, metricId, grain) {
   if (!points || !points.length) return [];
   if (grain !== "week") {
-    return points.map((p) => ({ date: p.date, value: Number(p.value) || 0, label: fmtShort(p.date) }));
+    return points.map((p) => ({
+      date: p.date,
+      value: metricFromAcc(p, metricId),
+      label: fmtShort(p.date),
+    }));
   }
   const map = new Map();
   for (const p of points) {
     const key = mondayIso(p.date);
-    map.set(key, (map.get(key) || 0) + (Number(p.value) || 0));
+    const acc = map.get(key) || blankAcc();
+    addAcc(acc, p);
+    map.set(key, acc);
   }
   return [...map.entries()]
     .sort((a, b) => (a[0] < b[0] ? -1 : 1))
-    .map(([date, value]) => ({ date, value, label: fmtShort(date) }));
+    .map(([date, acc]) => ({
+      date,
+      value: metricFromAcc(acc, metricId),
+      label: fmtShort(date),
+    }));
 }
 
 function niceMax(v) {
@@ -694,15 +764,58 @@ function trimNum(v) {
   return s.replace(".", ",");
 }
 
-function fmtAxis(v) {
+function fmtAxis(v, kind) {
+  if (kind === "pct") return `${trimNum(v)}%`;
   if (v >= 1_000_000) return `${trimNum(v / 1_000_000)} млн`;
   if (v >= 1000) return `${trimNum(v / 1000)} тыс`;
   return String(Math.round(v));
 }
 
+function fmtChartVal(col, v) {
+  if (v === null || v === undefined) return "—";
+  if (col.kind === "pct") return pct(v);
+  if (col.kind === "money") return money(v);
+  return int(v);
+}
+
+function selectedChartMetrics() {
+  return CHART_METRICS.filter((c) => state.chartMetrics[c.id]);
+}
+
+function saveChartMetrics() {
+  localStorage.setItem(CHART_METRICS_KEY, JSON.stringify(state.chartMetrics));
+}
+
+function renderChartMetricsItems() {
+  const box = $("chartMetricsItems");
+  if (!box) return;
+  box.innerHTML = CHART_METRICS.map(
+    (c) => `
+    <label>
+      <input type="checkbox" data-chart-metric="${c.id}" ${state.chartMetrics[c.id] ? "checked" : ""}>
+      <span>${esc(c.label)}</span>
+    </label>`
+  ).join("");
+}
+
 function visibleChartSeries() {
-  const all = state.chartData?.series || [];
-  return all.filter((s) => state.chartOn.has(s.id));
+  const entities = (state.chartData?.series || []).filter((s) => state.chartOn.has(s.id));
+  const metrics = selectedChartMetrics();
+  const out = [];
+  let colorI = 0;
+  for (const ent of entities) {
+    for (const m of metrics) {
+      out.push({
+        entityId: ent.id,
+        name: metrics.length > 1 ? `${ent.name} · ${m.label}` : ent.name,
+        metric: m,
+        color: CHART_COLORS[colorI % CHART_COLORS.length],
+        points: bucketMetric(ent.points, m.id, state.chartGrain),
+      });
+      colorI += 1;
+    }
+  }
+  return out;
 }
 
 function renderChart() {
@@ -723,14 +836,12 @@ function renderChart() {
   document.querySelectorAll("#chartGrain [data-grain]").forEach((btn) => {
     btn.classList.toggle("is-on", btn.dataset.grain === state.chartGrain);
   });
-  if (yLabel) yLabel.textContent = state.chartData.metric_label || "Расход, ₽";
 
-  const series = visibleChartSeries().map((s, i) => ({
-    ...s,
-    color: CHART_COLORS[i % CHART_COLORS.length],
-    points: bucketPoints(s.points, state.chartGrain),
-  }));
-  if (!series.length || series.every((s) => !s.points.length)) {
+  const series = visibleChartSeries();
+  const metrics = selectedChartMetrics();
+  const yText = metrics.length === 1 ? metrics[0].label : metrics.length ? "Показатели" : "Расход, ₽";
+  if (yLabel) yLabel.textContent = yText;
+  if (!series.length || !metrics.length || series.every((s) => !s.points.length)) {
     svgBox.innerHTML = "";
     legend.innerHTML = "";
     empty.hidden = false;
@@ -746,62 +857,117 @@ function renderChart() {
     .join("");
 
   const labels = series[0].points.map((p) => p.label);
-  const maxVal = niceMax(Math.max(0, ...series.flatMap((s) => s.points.map((p) => p.value))));
-  const w = Math.max(svgBox.clientWidth || 640, 320);
+  const n = labels.length;
+  const dayMode = state.chartGrain === "day";
+  const hasMoney = series.some((s) => s.metric.kind === "money");
+  const leftKind = hasMoney ? "money" : series[0].metric.kind;
+  const leftSeries = series.filter((s) => s.metric.kind === leftKind);
+  const rightSeries = series.filter((s) => s.metric.kind !== leftKind);
+  const maxL = niceMax(Math.max(0, ...leftSeries.flatMap((s) => s.points.map((p) => p.value))));
+  const maxR = rightSeries.length
+    ? niceMax(Math.max(0, ...rightSeries.flatMap((s) => s.points.map((p) => p.value))))
+    : null;
+  const boxW = Math.max(svgBox.clientWidth || 480, 280);
   const h = svgBox.clientHeight || 240;
-  const pad = { l: 48, r: 12, t: 18, b: 28 };
+  const pad = { l: 48, r: maxR ? 48 : 12, t: 22, b: dayMode ? 56 : 28 };
+  const minInner = dayMode ? Math.max(n * 22, 80) : 80;
+  const w = Math.max(boxW, pad.l + minInner + pad.r);
   const innerW = Math.max(1, w - pad.l - pad.r);
   const innerH = Math.max(1, h - pad.t - pad.b);
-  const xAt = (i, n) => pad.l + (n <= 1 ? innerW / 2 : (i / (n - 1)) * innerW);
-  const yAt = (v) => pad.t + innerH - (v / maxVal) * innerH;
-  const ticks = 3;
+  const xAt = (i) => pad.l + (n <= 1 ? innerW / 2 : (i / (n - 1)) * innerW);
+  const yAtL = (v) => pad.t + innerH - (v / maxL) * innerH;
+  const yAtR = (v) => pad.t + innerH - (v / (maxR || 1)) * innerH;
+  const yAt = (s, v) => (s.metric.kind === leftKind ? yAtL(v) : yAtR(v));
+
   let grid = "";
-  for (let i = 0; i <= ticks; i += 1) {
-    const v = (maxVal * (ticks - i)) / ticks;
-    const y = yAt(v);
+  for (let i = 0; i <= 3; i += 1) {
+    const v = (maxL * (3 - i)) / 3;
+    const y = yAtL(v);
     grid += `<line x1="${pad.l}" x2="${w - pad.r}" y1="${y}" y2="${y}" stroke="#eef2f6" stroke-width="1"/>`;
-    grid += `<text x="${pad.l - 8}" y="${y + 3}" text-anchor="end" fill="#98a2b3" font-size="11">${esc(fmtAxis(v))}</text>`;
+    grid += `<text x="${pad.l - 8}" y="${y + 3}" text-anchor="end" fill="#98a2b3" font-size="11">${esc(fmtAxis(v, leftKind))}</text>`;
+    if (maxR) {
+      const vr = (maxR * (3 - i)) / 3;
+      grid += `<text x="${w - pad.r + 8}" y="${y + 3}" text-anchor="start" fill="#98a2b3" font-size="11">${esc(fmtAxis(vr, rightSeries[0].metric.kind))}</text>`;
+    }
   }
-  const n = labels.length;
-  const labelStep = Math.max(1, Math.ceil(n / 6));
   let xLabels = "";
   labels.forEach((lab, i) => {
-    if (i % labelStep !== 0 && i !== n - 1) return;
-    xLabels += `<text x="${xAt(i, n)}" y="${h - 6}" text-anchor="middle" fill="#98a2b3" font-size="11">${esc(lab)}</text>`;
+    if (!dayMode) {
+      const step = Math.max(1, Math.ceil(n / 6));
+      if (i % step !== 0 && i !== n - 1) return;
+      xLabels += `<text x="${xAt(i)}" y="${h - 8}" text-anchor="middle" fill="#98a2b3" font-size="11">${esc(lab)}</text>`;
+      return;
+    }
+    xLabels += `<text x="${xAt(i)}" y="${h - 8}" text-anchor="end" fill="#98a2b3" font-size="10" transform="rotate(-55 ${xAt(i)} ${h - 10})">${esc(lab)}</text>`;
   });
   const lines = series
     .map((s) => {
-      const d = s.points.map((p, i) => `${i ? "L" : "M"}${xAt(i, n)} ${yAt(p.value)}`).join(" ");
+      const d = s.points.map((p, i) => `${i ? "L" : "M"}${xAt(i)} ${yAt(s, p.value)}`).join(" ");
       return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
     })
     .join("");
-  svgBox.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img">${grid}${lines}${xLabels}</svg>`;
+  const slot = n > 1 ? innerW / (n - 1) : 16;
+  svgBox.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img">
+    ${grid}${lines}${xLabels}
+    <g id="chartCrosshair" display="none">
+      <rect id="chartVBand" fill="rgba(0,91,255,.10)" />
+      <line id="chartVLine" stroke="#005bff" stroke-width="1" stroke-dasharray="4 3"/>
+      <line id="chartHLine" stroke="#005bff" stroke-width="1" stroke-dasharray="4 3"/>
+    </g>
+  </svg>`;
 
   const hover = (ev) => {
-    const rect = svgBox.getBoundingClientRect();
-    const x = ev.clientX - rect.left;
-    if (n <= 0) return;
+    const svg = svgBox.querySelector("svg");
+    const cross = $("chartCrosshair") || svg?.querySelector("#chartCrosshair");
+    if (!svg || n <= 0) return;
+    const rect = svg.getBoundingClientRect();
+    const scaleX = w / rect.width;
+    const scaleY = h / rect.height;
+    const x = (ev.clientX - rect.left) * scaleX;
+    const y = (ev.clientY - rect.top) * scaleY;
     let idx = 0;
     let best = Infinity;
     for (let i = 0; i < n; i += 1) {
-      const dx = Math.abs(xAt(i, n) - x);
+      const dx = Math.abs(xAt(i) - x);
       if (dx < best) {
         best = dx;
         idx = i;
       }
     }
+    const cx = xAt(idx);
+    const band = Math.max(8, slot * 0.7);
+    const vBand = svg.querySelector("#chartVBand");
+    const vLine = svg.querySelector("#chartVLine");
+    const hLine = svg.querySelector("#chartHLine");
+    const g = svg.querySelector("#chartCrosshair");
+    g.setAttribute("display", "block");
+    vBand.setAttribute("x", String(cx - band / 2));
+    vBand.setAttribute("y", String(pad.t));
+    vBand.setAttribute("width", String(band));
+    vBand.setAttribute("height", String(innerH));
+    vLine.setAttribute("x1", String(cx));
+    vLine.setAttribute("x2", String(cx));
+    vLine.setAttribute("y1", String(pad.t));
+    vLine.setAttribute("y2", String(pad.t + innerH));
+    const hy = Math.min(pad.t + innerH, Math.max(pad.t, y));
+    hLine.setAttribute("x1", String(pad.l));
+    hLine.setAttribute("x2", String(w - pad.r));
+    hLine.setAttribute("y1", String(hy));
+    hLine.setAttribute("y2", String(hy));
     const rows = series
-      .map((s) => `<div><b style="color:${s.color}">${esc(s.name)}</b>: ${money(s.points[idx]?.value)}</div>`)
+      .map((s) => `<div><b style="color:${s.color}">${esc(s.name)}</b>: ${fmtChartVal(s.metric, s.points[idx]?.value)}</div>`)
       .join("");
     tip.hidden = false;
-    tip.innerHTML = `<div>${esc(labels[idx])} · ${esc(state.chartData.metric_label || "Расход, ₽")}</div>${rows}`;
-    const left = Math.min(rect.width - 160, Math.max(8, x + 12));
+    tip.innerHTML = `<div>${esc(labels[idx])}</div>${rows}`;
+    const left = Math.min(svgBox.clientWidth - 170, Math.max(8, ev.clientX - svgBox.getBoundingClientRect().left + 12));
     tip.style.left = `${left}px`;
     tip.style.top = `12px`;
   };
   svgBox.onmousemove = hover;
   svgBox.onmouseleave = () => {
     tip.hidden = true;
+    const g = svgBox.querySelector("#chartCrosshair");
+    if (g) g.setAttribute("display", "none");
   };
 }
 
@@ -854,7 +1020,7 @@ function filteredItems() {
   });
 }
 
-function campRow(c, pillClassName, pillText) {
+function campRow(c, pillClassName, pillText, sku) {
   const meta = [
     `<span class="pill ${pillClassName}">${esc(pillText)}</span>`,
     c.id
@@ -866,8 +1032,11 @@ function campRow(c, pillClassName, pillText) {
   return `
     <div class="camp-row">
       <div class="camp-text">
-        <div class="camp-name" title="${esc(c.name)}">${esc(c.name)}</div>
-        <div class="camp-meta">${meta.join('<span class="camp-sep" aria-hidden="true">|</span>')}</div>
+        ${eyeBtn(campChartId(sku, c.id))}
+        <div class="camp-text__body">
+          <div class="camp-name" title="${esc(c.name)}">${esc(c.name)}</div>
+          <div class="camp-meta">${meta.join('<span class="camp-sep" aria-hidden="true">|</span>')}</div>
+        </div>
       </div>
       ${metrics(c)}
     </div>`;
@@ -877,7 +1046,7 @@ function campsHtml(p) {
   const rows = [];
   for (const [key, cls, text] of CAMP_ORDER) {
     for (const c of p.campaigns[key] || []) {
-      rows.push(campRow(c, cls, text));
+      rows.push(campRow(c, cls, text, p.sku));
     }
   }
   return rows.join("") || `<div class="empty">Кампаний нет</div>`;
@@ -932,6 +1101,7 @@ function render() {
   if (!filtered.length) {
     list.innerHTML = `<div class="empty">Нет строк за выбранный период и фильтры</div>`;
     renderPager(filtered);
+    bindChartEyes();
     return;
   }
 
@@ -979,14 +1149,18 @@ function render() {
       btn.closest(".prod-row").classList.toggle("open");
     });
   });
+  bindChartEyes();
+  renderPager(filtered);
+  syncHScroll();
+}
+
+function bindChartEyes() {
   document.querySelectorAll("[data-chart-id]").forEach((btn) => {
     btn.addEventListener("click", (e) => {
       e.stopPropagation();
       toggleChartId(btn.dataset.chartId);
     });
   });
-  renderPager(filtered);
-  syncHScroll();
 }
 
 async function loadMeta() {
@@ -1000,8 +1174,8 @@ async function loadMeta() {
     state.from = meta.max_date;
     state.to = meta.max_date;
   }
-  state.draftFrom = meta.max_date;
-  state.draftTo = meta.max_date;
+  state.draftFrom = state.from;
+  state.draftTo = state.to;
   state.view = new Date(parseYmd(meta.max_date).getFullYear(), parseYmd(meta.max_date).getMonth() - 1, 1);
   updateRangeBtn();
   state.opts.g1 = meta.groups1 || [];
@@ -1239,6 +1413,30 @@ $("colsItems").addEventListener("change", (e) => {
   saveCols();
   if (state.data) render();
   else renderMetricHead();
+});
+
+$("chartMetricsBtn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if (!$("chartMetricsPop").hidden) {
+    closeAllPops();
+    return;
+  }
+  closeAllPops();
+  renderChartMetricsItems();
+  $("chartMetricsPop").hidden = false;
+  $("chartMetricsWrap").classList.add("open");
+});
+$("chartMetricsPop").addEventListener("click", (e) => e.stopPropagation());
+$("chartMetricsItems").addEventListener("change", (e) => {
+  const t = e.target;
+  if (!t.matches("input[data-chart-metric]")) return;
+  state.chartMetrics[t.dataset.chartMetric] = t.checked;
+  if (!CHART_METRICS.some((c) => state.chartMetrics[c.id])) {
+    state.chartMetrics.expense = true;
+    renderChartMetricsItems();
+  }
+  saveChartMetrics();
+  renderChart();
 });
 
 $("tableSearch").addEventListener("input", () => {

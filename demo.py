@@ -502,39 +502,106 @@ def chart(date_from, date_to, filters):
         while cur <= date_to:
             days.append(cur)
             cur += timedelta(days=1)
+
+    add_keys = (
+        "sales",
+        "expense",
+        "views",
+        "clicks",
+        "to_cart",
+        "model_orders",
+        "model_sales",
+        "budget",
+        "gmv",
+    )
     series = []
-    total_pts = [0.0] * len(days)
-    for idx, item in enumerate(payload["items"]):
-        weights = _day_weights(days, idx * 0.7)
-        values = _distribute(item.get("expense") or 0, weights)
-        for i, val in enumerate(values):
-            total_pts[i] += val
+    sku_days: dict[str, list[dict]] = {}
+    camp_n = 0
+    for pi, item in enumerate(payload["items"]):
+        camps = [c for key in item["campaigns"] for c in item["campaigns"][key]]
+        sku_acc = [{k: 0.0 for k in add_keys} for _ in days]
+        gmv_daily = _distribute(item.get("gmv") or 0, _day_weights(days, pi * 0.4))
+        for ci, camp in enumerate(camps):
+            weights = _day_weights(days, pi * 0.7 + ci * 0.33)
+            vals = {k: _distribute(camp.get(k) or 0, weights) for k in add_keys if k != "gmv"}
+            by_date = {}
+            for i, d in enumerate(days):
+                acc = {k: vals[k][i] for k in vals}
+                acc["gmv"] = gmv_daily[i]
+                by_date[d.isoformat()] = acc
+                for k in add_keys:
+                    if k == "gmv":
+                        sku_acc[i][k] = max(sku_acc[i][k], acc[k])
+                    else:
+                        sku_acc[i][k] += acc[k]
+            series.append(
+                {
+                    "id": f"camp:{item['sku']}:{camp['id']}",
+                    "kind": "campaign",
+                    "name": camp["name"],
+                    "points": _points_from_days_demo(days, by_date),
+                }
+            )
+            camp_n += 1
+        sku_days[item["sku"]] = sku_acc
+        sku_by_date = {days[i].isoformat(): sku_acc[i] for i in range(len(days))}
         series.append(
             {
                 "id": item["sku"],
+                "kind": "sku",
                 "name": item["name"],
-                "points": [
-                    {"date": days[i].isoformat(), "value": values[i]}
-                    for i in range(len(days))
-                ],
+                "points": _points_from_days_demo(days, sku_by_date),
             }
         )
+
+    total_acc = [{k: 0.0 for k in add_keys} for _ in days]
+    for acc_list in sku_days.values():
+        for i, acc in enumerate(acc_list):
+            for k in add_keys:
+                total_acc[i][k] += acc[k]
+    total_by_date = {days[i].isoformat(): total_acc[i] for i in range(len(days))}
     series.insert(
         0,
         {
             "id": "total",
+            "kind": "total",
             "name": "Итого",
-            "points": [
-                {"date": days[i].isoformat(), "value": round(total_pts[i], 2)}
-                for i in range(len(days))
-            ],
+            "points": _points_from_days_demo(days, total_by_date),
         },
     )
     return {
         "demo": True,
         "from": date_from.isoformat() if date_from else None,
         "to": date_to.isoformat() if date_to else None,
-        "metric": "expense",
-        "metric_label": "Расход, ₽",
         "series": series,
     }
+
+
+def _points_from_days_demo(days, by_date):
+    out = []
+    for d in days:
+        acc = by_date.get(d.isoformat()) or {}
+        sales = float(acc.get("sales") or 0)
+        expense = float(acc.get("expense") or 0)
+        views = float(acc.get("views") or 0)
+        clicks = float(acc.get("clicks") or 0)
+        gmv = float(acc.get("gmv") or 0)
+        out.append(
+            {
+                "date": d.isoformat(),
+                "sales": round(sales, 2),
+                "expense": round(expense, 2),
+                "views": int(round(views)),
+                "clicks": int(round(clicks)),
+                "to_cart": int(round(float(acc.get("to_cart") or 0))),
+                "model_orders": int(round(float(acc.get("model_orders") or 0))),
+                "model_sales": round(float(acc.get("model_sales") or 0), 2),
+                "budget": round(float(acc.get("budget") or 0), 2),
+                "gmv": round(gmv, 2),
+                "drr": _ratio(expense, sales),
+                "general_drr": _ratio(expense, gmv),
+                "ctr": _ratio(clicks, views),
+                "cpc": _unit(expense, clicks),
+            }
+        )
+    return out

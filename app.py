@@ -692,67 +692,146 @@ def api_products():
 
 def empty_chart(date_from, date_to, demo=False):
     days = each_day(date_from, date_to)
+    blank = _metrics_from_acc({})
     return {
         "demo": demo,
         "from": date_from.isoformat() if date_from else None,
         "to": date_to.isoformat() if date_to else None,
-        "metric": "expense",
-        "metric_label": "Расход, ₽",
         "series": [
             {
                 "id": "total",
+                "kind": "total",
                 "name": "Итого",
-                "points": [
-                    {"date": d.isoformat(), "value": 0} for d in days
-                ],
+                "points": [{"date": d.isoformat(), **blank} for d in days],
             }
         ],
     }
 
 
+def _metrics_from_acc(acc):
+    sales = num(acc.get("sales"))
+    expense = num(acc.get("expense"))
+    views = num(acc.get("views"))
+    clicks = num(acc.get("clicks"))
+    gmv = num(acc.get("gmv"))
+    return {
+        "sales": round(sales, 2),
+        "expense": round(expense, 2),
+        "views": int(views),
+        "clicks": int(clicks),
+        "to_cart": int(num(acc.get("to_cart"))),
+        "model_orders": int(num(acc.get("model_orders"))),
+        "model_sales": round(num(acc.get("model_sales")), 2),
+        "budget": round(num(acc.get("budget")), 2),
+        "gmv": round(gmv, 2),
+        "drr": ratio(expense, sales),
+        "general_drr": ratio(expense, gmv),
+        "ctr": ratio(clicks, views),
+        "cpc": unit_price(expense, clicks),
+    }
+
+
+def _add_into(dst, src, gmv="sum"):
+    for key in (
+        "sales",
+        "expense",
+        "views",
+        "clicks",
+        "to_cart",
+        "model_orders",
+        "model_sales",
+        "budget",
+    ):
+        dst[key] = num(dst.get(key)) + num(src.get(key))
+    if gmv == "max":
+        dst["gmv"] = max(num(dst.get("gmv")), num(src.get("gmv")))
+    else:
+        dst["gmv"] = num(dst.get("gmv")) + num(src.get("gmv"))
+
+
+def _points_from_days(days, by_date):
+    out = []
+    for d in days:
+        out.append({"date": d.isoformat(), **_metrics_from_acc(by_date.get(d.isoformat()) or {})})
+    return out
+
+
 def pack_chart_series(date_from, date_to, rows):
     days = each_day(date_from, date_to)
-    by_sku: dict[str, dict] = {}
+    camps: dict[tuple[str, str], dict] = {}
     for row in rows:
-        sku = str(row["sku"] or "").strip()
-        if not sku:
+        sku = str(row.get("sku") or "").strip()
+        camp_id = str(row.get("campaign_id") or "").strip()
+        if not sku or not camp_id:
             continue
         day = row["report_date"]
-        if hasattr(day, "isoformat"):
-            day_s = day.isoformat()[:10]
-        else:
-            day_s = str(day)[:10]
-        item = by_sku.setdefault(
-            sku, {"name": row.get("nom_name") or sku, "vals": {}}
+        day_s = day.isoformat()[:10] if hasattr(day, "isoformat") else str(day)[:10]
+        item = camps.setdefault(
+            (sku, camp_id),
+            {
+                "sku": sku,
+                "campaign_id": camp_id,
+                "name": row.get("campaign_name") or camp_id,
+                "nom_name": row.get("nom_name") or sku,
+                "vals": {},
+            },
         )
+        if row.get("campaign_name"):
+            item["name"] = row["campaign_name"]
         if row.get("nom_name"):
-            item["name"] = row["nom_name"]
-        item["vals"][day_s] = item["vals"].get(day_s, 0) + num(row.get("expense"))
-    series = []
-    total_vals = {d.isoformat(): 0.0 for d in days}
-    ranked = sorted(
-        by_sku.items(),
-        key=lambda kv: -sum(kv[1]["vals"].values()),
-    )
-    for sku, item in ranked:
-        points = []
-        for d in days:
-            key = d.isoformat()
-            val = round(float(item["vals"].get(key, 0)), 2)
-            total_vals[key] += val
-            points.append({"date": key, "value": val})
-        series.append({"id": sku, "name": item["name"], "points": points})
-    series.insert(
-        0,
+            item["nom_name"] = row["nom_name"]
+        acc = item["vals"].setdefault(day_s, {})
+        _add_into(acc, row, gmv="max")
+
+    sku_days: dict[str, dict] = {}
+    sku_names: dict[str, str] = {}
+    for (sku, camp_id), item in camps.items():
+        sku_names[sku] = item["nom_name"]
+        by_day = sku_days.setdefault(sku, {})
+        for day_s, acc in item["vals"].items():
+            dst = by_day.setdefault(day_s, {})
+            _add_into(dst, acc, gmv="max")
+
+    total_days: dict[str, dict] = {}
+    for by_day in sku_days.values():
+        for day_s, acc in by_day.items():
+            dst = total_days.setdefault(day_s, {})
+            _add_into(dst, acc, gmv="sum")
+
+    series = [
         {
             "id": "total",
+            "kind": "total",
             "name": "Итого",
-            "points": [
-                {"date": d.isoformat(), "value": round(total_vals[d.isoformat()], 2)}
-                for d in days
-            ],
-        },
+            "points": _points_from_days(days, total_days),
+        }
+    ]
+    sku_ranked = sorted(
+        sku_days.items(),
+        key=lambda kv: -sum(num(acc.get("expense")) for acc in kv[1].values()),
     )
+    for sku, by_day in sku_ranked:
+        series.append(
+            {
+                "id": sku,
+                "kind": "sku",
+                "name": sku_names.get(sku) or sku,
+                "points": _points_from_days(days, by_day),
+            }
+        )
+    camp_ranked = sorted(
+        camps.values(),
+        key=lambda item: -sum(num(acc.get("expense")) for acc in item["vals"].values()),
+    )
+    for item in camp_ranked:
+        series.append(
+            {
+                "id": f"camp:{item['sku']}:{item['campaign_id']}",
+                "kind": "campaign",
+                "name": item["name"],
+                "points": _points_from_days(days, item["vals"]),
+            }
+        )
     return series
 
 
@@ -774,15 +853,25 @@ def api_chart():
     sql = SRC_CTE.format(extra_sql=ctx["extra_sql"]).rstrip() + f"""
     SELECT
         s.sku,
+        s.campaign_id,
+        MAX(s.campaign_name) AS campaign_name,
         MAX(s.nom_name) AS nom_name,
         CAST(s.report_date AS date) AS report_date,
-        SUM(s.expense) AS expense
+        SUM(s.sales) AS sales,
+        SUM(s.expense) AS expense,
+        SUM(s.views) AS views,
+        SUM(s.clicks) AS clicks,
+        SUM(s.to_cart) AS to_cart,
+        SUM(s.model_orders) AS model_orders,
+        SUM(s.model_sales) AS model_sales,
+        MAX(s.weekly_budget) AS budget,
+        MAX(s.product_gmv) AS gmv
     FROM src AS s
     INNER JOIN camp_status AS cs
         ON cs.sku = s.sku AND cs.campaign_id = s.campaign_id
     WHERE LTRIM(RTRIM(ISNULL(cs.status, N''))) IN ({status_ph})
-    GROUP BY s.sku, CAST(s.report_date AS date)
-    ORDER BY s.sku, CAST(s.report_date AS date);
+    GROUP BY s.sku, s.campaign_id, CAST(s.report_date AS date)
+    ORDER BY s.sku, s.campaign_id, CAST(s.report_date AS date);
     """
     with connect() as conn:
         cur = conn.cursor()
@@ -793,8 +882,6 @@ def api_chart():
             "demo": False,
             "from": date_from.isoformat(),
             "to": date_to.isoformat(),
-            "metric": "expense",
-            "metric_label": "Расход, ₽",
             "series": pack_chart_series(date_from, date_to, raw),
         }
     )

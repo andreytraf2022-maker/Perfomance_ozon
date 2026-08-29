@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OZON Performance — товары</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/app.css?v=13">
+  <link rel="stylesheet" href="/static/app.css?v=14">
 </head>
 <body>
   <header class="top">
@@ -274,6 +274,13 @@
     <div class="chart-card__head">
       <div class="chart-card__title">График</div>
       <div class="chart-card__tools">
+        <div class="range-wrap" id="chartMetricsWrap">
+          <button type="button" class="chart-link" id="chartMetricsBtn">Настройка графика</button>
+          <div class="status-pop cols-pop chart-metrics-pop" id="chartMetricsPop" hidden>
+            <div class="cols-pop__title">Показатели на графике</div>
+            <div id="chartMetricsItems"></div>
+          </div>
+        </div>
         <button type="button" class="chart-link" id="chartExpand">Развернуть график</button>
         <div class="chart-grain" id="chartGrain">
           <button type="button" data-grain="day">День</button>
@@ -287,7 +294,7 @@
       <div class="chart-tip" id="chartTip" hidden></div>
     </div>
     <div class="chart-legend" id="chartLegend"></div>
-    <div class="chart-empty" id="chartEmpty" hidden>Включите глазик у «Итого» или у товара, чтобы показать ряд на графике</div>
+    <div class="chart-empty" id="chartEmpty" hidden>Включите глазик и показатель в настройке графика</div>
   </section>
 
   <div class="table-shell">
@@ -345,6 +352,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=14"></script>
 </body>
 </html>

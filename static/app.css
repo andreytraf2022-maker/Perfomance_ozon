@@ -833,7 +833,21 @@ a.camp-id:hover {
 
 .camp-row:hover { background: #f8fafc; }
 
-.camp-text { min-width: 0; }
+.camp-text {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+}
+
+.camp-text__body { min-width: 0; flex: 1; }
+
+.chart-metrics-pop {
+  right: 0;
+  left: auto;
+  max-height: 360px;
+  overflow: auto;
+}
 
 .camp-name {
   font-weight: 600;
@@ -906,6 +920,12 @@ a.camp-id:hover {
   border: 1px solid var(--line);
   border-radius: 12px;
   box-shadow: var(--shadow);
+  max-width: 680px;
+  width: calc(100% - 48px);
+}
+
+.chart-card.is-wide {
+  max-width: 860px;
 }
 
 .chart-card__head {
@@ -985,7 +1005,7 @@ a.camp-id:hover {
   font-size: 12px;
 }
 
-.chart-svg { min-width: 0; height: 100%; }
+.chart-svg { min-width: 0; height: 100%; overflow-x: auto; overflow-y: hidden; }
 
 .chart-svg svg { width: 100%; height: 100%; display: block; }
 
