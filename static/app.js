@@ -74,20 +74,18 @@ const emptyLists = () => ({
   campaign: [],
 });
 
-function loadChartMetrics() {
-  const all = Object.fromEntries(CHART_METRICS.map((c) => [c.id, c.id === "expense"]));
+function loadChartMetric() {
   try {
     const raw = JSON.parse(localStorage.getItem(CHART_METRICS_KEY) || "null");
+    if (typeof raw === "string" && CHART_METRICS.some((c) => c.id === raw)) return raw;
     if (raw && typeof raw === "object") {
-      for (const c of CHART_METRICS) {
-        if (typeof raw[c.id] === "boolean") all[c.id] = raw[c.id];
-      }
+      const found = CHART_METRICS.find((c) => raw[c.id]);
+      if (found) return found.id;
     }
   } catch {
-    /* keep defaults */
+    /* keep default */
   }
-  if (!CHART_METRICS.some((c) => all[c.id])) all.expense = true;
-  return all;
+  return "expense";
 }
 
 function loadCols() {
@@ -133,7 +131,7 @@ const state = {
   chartExpanded: false,
   chartOn: new Set([TOTAL_CHART_ID]),
   chartData: null,
-  chartMetrics: loadChartMetrics(),
+  chartMetric: loadChartMetric(),
 };
 
 const esc = (s) =>
@@ -435,12 +433,7 @@ function closeColsPop() {
   $("colsWrap").classList.remove("open");
 }
 
-function closeChartMetricsPop() {
-  const pop = $("chartMetricsPop");
-  const wrap = $("chartMetricsWrap");
-  if (pop) pop.hidden = true;
-  if (wrap) wrap.classList.remove("open");
-}
+function closeChartMetricsPop() {}
 
 function closeStatusPop() {
   $("statusPop").hidden = true;
@@ -767,23 +760,36 @@ function trimNum(v) {
 function fmtAxis(v, kind) {
   if (kind === "pct") return `${trimNum(v)}%`;
   if (v >= 1_000_000) return `${trimNum(v / 1_000_000)} млн`;
-  if (v >= 1000) return `${trimNum(v / 1000)} тыс`;
+  if (v >= 1000) return `${trimNum(v / 1000)} K`;
   return String(Math.round(v));
 }
 
 function fmtChartVal(col, v) {
   if (v === null || v === undefined) return "—";
   if (col.kind === "pct") return pct(v);
-  if (col.kind === "money") return money(v);
+  if (col.kind === "money") return `${money(v)} ₽`;
   return int(v);
 }
 
-function selectedChartMetrics() {
-  return CHART_METRICS.filter((c) => state.chartMetrics[c.id]);
+function fmtLongDate(s) {
+  if (!s) return "";
+  const d = parseYmd(s);
+  return `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
 }
 
-function saveChartMetrics() {
-  localStorage.setItem(CHART_METRICS_KEY, JSON.stringify(state.chartMetrics));
+function fmtAxisDate(s) {
+  if (!s) return "";
+  const d = parseYmd(s);
+  const wd = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"][d.getDay()];
+  return `${d.getDate()}, ${wd}`;
+}
+
+function currentChartMetric() {
+  return CHART_METRICS.find((c) => c.id === state.chartMetric) || CHART_METRICS.find((c) => c.id === "expense");
+}
+
+function saveChartMetric() {
+  localStorage.setItem(CHART_METRICS_KEY, JSON.stringify(state.chartMetric));
 }
 
 function renderChartMetricsItems() {
@@ -792,30 +798,26 @@ function renderChartMetricsItems() {
   box.innerHTML = CHART_METRICS.map(
     (c) => `
     <label>
-      <input type="checkbox" data-chart-metric="${c.id}" ${state.chartMetrics[c.id] ? "checked" : ""}>
+      <input type="radio" name="chartMetric" data-chart-metric="${c.id}" ${state.chartMetric === c.id ? "checked" : ""}>
       <span>${esc(c.label)}</span>
     </label>`
   ).join("");
 }
 
 function visibleChartSeries() {
+  const metric = currentChartMetric();
+  if (!metric) return [];
   const entities = (state.chartData?.series || []).filter((s) => state.chartOn.has(s.id));
-  const metrics = selectedChartMetrics();
-  const out = [];
-  let colorI = 0;
-  for (const ent of entities) {
-    for (const m of metrics) {
-      out.push({
-        entityId: ent.id,
-        name: metrics.length > 1 ? `${ent.name} · ${m.label}` : ent.name,
-        metric: m,
-        color: CHART_COLORS[colorI % CHART_COLORS.length],
-        points: bucketMetric(ent.points, m.id, state.chartGrain),
-      });
-      colorI += 1;
-    }
-  }
-  return out;
+  return entities.map((ent, i) => ({
+    entityId: ent.id,
+    name: ent.name,
+    metric,
+    color: CHART_COLORS[i % CHART_COLORS.length],
+    points: bucketMetric(ent.points, metric.id, state.chartGrain).map((p) => ({
+      ...p,
+      label: fmtAxisDate(p.date),
+    })),
+  }));
 }
 
 function renderChart() {
@@ -838,10 +840,9 @@ function renderChart() {
   });
 
   const series = visibleChartSeries();
-  const metrics = selectedChartMetrics();
-  const yText = metrics.length === 1 ? metrics[0].label : metrics.length ? "Показатели" : "Расход, ₽";
-  if (yLabel) yLabel.textContent = yText;
-  if (!series.length || !metrics.length || series.every((s) => !s.points.length)) {
+  const metric = currentChartMetric();
+  if (yLabel) yLabel.textContent = metric ? metric.label : "Расход, ₽";
+  if (!series.length || series.every((s) => !s.points.length)) {
     svgBox.innerHTML = "";
     legend.innerHTML = "";
     empty.hidden = false;
@@ -857,73 +858,54 @@ function renderChart() {
     .join("");
 
   const labels = series[0].points.map((p) => p.label);
+  const dates = series[0].points.map((p) => p.date);
   const n = labels.length;
   const dayMode = state.chartGrain === "day";
-  const hasMoney = series.some((s) => s.metric.kind === "money");
-  const leftKind = hasMoney ? "money" : series[0].metric.kind;
-  const leftSeries = series.filter((s) => s.metric.kind === leftKind);
-  const rightSeries = series.filter((s) => s.metric.kind !== leftKind);
-  const maxL = niceMax(Math.max(0, ...leftSeries.flatMap((s) => s.points.map((p) => p.value))));
-  const maxR = rightSeries.length
-    ? niceMax(Math.max(0, ...rightSeries.flatMap((s) => s.points.map((p) => p.value))))
-    : null;
+  const maxL = niceMax(Math.max(0, ...series.flatMap((s) => s.points.map((p) => p.value))));
   const boxW = Math.max(svgBox.clientWidth || 480, 280);
-  const h = svgBox.clientHeight || 240;
-  const pad = { l: 48, r: maxR ? 48 : 12, t: 22, b: dayMode ? 56 : 28 };
-  const minInner = dayMode ? Math.max(n * 22, 80) : 80;
+  const h = svgBox.clientHeight || 260;
+  const pad = { l: 44, r: 12, t: 22, b: dayMode ? 36 : 28 };
+  const minInner = dayMode ? Math.max(n * 28, 80) : 80;
   const w = Math.max(boxW, pad.l + minInner + pad.r);
   const innerW = Math.max(1, w - pad.l - pad.r);
   const innerH = Math.max(1, h - pad.t - pad.b);
   const xAt = (i) => pad.l + (n <= 1 ? innerW / 2 : (i / (n - 1)) * innerW);
-  const yAtL = (v) => pad.t + innerH - (v / maxL) * innerH;
-  const yAtR = (v) => pad.t + innerH - (v / (maxR || 1)) * innerH;
-  const yAt = (s, v) => (s.metric.kind === leftKind ? yAtL(v) : yAtR(v));
+  const yAt = (v) => pad.t + innerH - (v / maxL) * innerH;
 
   let grid = "";
   for (let i = 0; i <= 3; i += 1) {
     const v = (maxL * (3 - i)) / 3;
-    const y = yAtL(v);
+    const y = yAt(v);
     grid += `<line x1="${pad.l}" x2="${w - pad.r}" y1="${y}" y2="${y}" stroke="#eef2f6" stroke-width="1"/>`;
-    grid += `<text x="${pad.l - 8}" y="${y + 3}" text-anchor="end" fill="#98a2b3" font-size="11">${esc(fmtAxis(v, leftKind))}</text>`;
-    if (maxR) {
-      const vr = (maxR * (3 - i)) / 3;
-      grid += `<text x="${w - pad.r + 8}" y="${y + 3}" text-anchor="start" fill="#98a2b3" font-size="11">${esc(fmtAxis(vr, rightSeries[0].metric.kind))}</text>`;
-    }
+    grid += `<text x="${pad.l - 6}" y="${y + 3}" text-anchor="end" fill="#98a2b3" font-size="11">${esc(fmtAxis(v, metric.kind))}</text>`;
   }
   let xLabels = "";
   labels.forEach((lab, i) => {
     if (!dayMode) {
-      const step = Math.max(1, Math.ceil(n / 6));
+      const step = Math.max(1, Math.ceil(n / 8));
       if (i % step !== 0 && i !== n - 1) return;
-      xLabels += `<text x="${xAt(i)}" y="${h - 8}" text-anchor="middle" fill="#98a2b3" font-size="11">${esc(lab)}</text>`;
-      return;
     }
-    xLabels += `<text x="${xAt(i)}" y="${h - 8}" text-anchor="end" fill="#98a2b3" font-size="10" transform="rotate(-55 ${xAt(i)} ${h - 10})">${esc(lab)}</text>`;
+    xLabels += `<text x="${xAt(i)}" y="${h - 8}" text-anchor="middle" fill="#98a2b3" font-size="11">${esc(lab)}</text>`;
   });
   const lines = series
     .map((s) => {
-      const d = s.points.map((p, i) => `${i ? "L" : "M"}${xAt(i)} ${yAt(s, p.value)}`).join(" ");
-      return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2.2" stroke-linejoin="round" stroke-linecap="round"/>`;
+      const d = s.points.map((p, i) => `${i ? "L" : "M"}${xAt(i)} ${yAt(p.value)}`).join(" ");
+      return `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
     })
     .join("");
-  const slot = n > 1 ? innerW / (n - 1) : 16;
   svgBox.innerHTML = `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img">
     ${grid}${lines}${xLabels}
     <g id="chartCrosshair" display="none">
-      <rect id="chartVBand" fill="rgba(0,91,255,.10)" />
-      <line id="chartVLine" stroke="#005bff" stroke-width="1" stroke-dasharray="4 3"/>
-      <line id="chartHLine" stroke="#005bff" stroke-width="1" stroke-dasharray="4 3"/>
+      <line id="chartVLine" stroke="#c5d0e0" stroke-width="1"/>
+      <g id="chartDots"></g>
     </g>
   </svg>`;
 
   const hover = (ev) => {
     const svg = svgBox.querySelector("svg");
-    const cross = $("chartCrosshair") || svg?.querySelector("#chartCrosshair");
     if (!svg || n <= 0) return;
     const rect = svg.getBoundingClientRect();
-    const scaleX = w / rect.width;
-    const x = (ev.clientX - rect.left) * scaleX;
-    const y = (ev.clientY - rect.top) * (h / rect.height);
+    const x = (ev.clientX - rect.left) * (w / rect.width);
     let idx = 0;
     let best = Infinity;
     for (let i = 0; i < n; i += 1) {
@@ -934,33 +916,35 @@ function renderChart() {
       }
     }
     const cx = xAt(idx);
-    const band = Math.max(8, slot * 0.7);
-    const vBand = svg.querySelector("#chartVBand");
     const vLine = svg.querySelector("#chartVLine");
-    const hLine = svg.querySelector("#chartHLine");
+    const dots = svg.querySelector("#chartDots");
     const g = svg.querySelector("#chartCrosshair");
     g.setAttribute("display", "block");
-    vBand.setAttribute("x", String(cx - band / 2));
-    vBand.setAttribute("y", String(pad.t));
-    vBand.setAttribute("width", String(band));
-    vBand.setAttribute("height", String(innerH));
     vLine.setAttribute("x1", String(cx));
     vLine.setAttribute("x2", String(cx));
     vLine.setAttribute("y1", String(pad.t));
     vLine.setAttribute("y2", String(pad.t + innerH));
-    const hy = Math.min(pad.t + innerH, Math.max(pad.t, y));
-    hLine.setAttribute("x1", String(pad.l));
-    hLine.setAttribute("x2", String(w - pad.r));
-    hLine.setAttribute("y1", String(hy));
-    hLine.setAttribute("y2", String(hy));
-    const rows = series
-      .map((s) => `<div><b style="color:${s.color}">${esc(s.name)}</b>: ${fmtChartVal(s.metric, s.points[idx]?.value)}</div>`)
+    dots.innerHTML = series
+      .map((s) => {
+        const cy = yAt(s.points[idx]?.value || 0);
+        return `<circle cx="${cx}" cy="${cy}" r="5" fill="#fff" stroke="${s.color}" stroke-width="2"/>`;
+      })
+      .join("");
+    const valueRows = series
+      .map((s) => {
+        const val = fmtChartVal(s.metric, s.points[idx]?.value);
+        if (series.length === 1) {
+          return `<div class="chart-tip__row"><span>${esc(metric.label.replace(/, ₽$/, "").replace(/, %$/, ""))}</span><b>${val}</b></div>`;
+        }
+        return `<div class="chart-tip__row"><span>${esc(s.name)}</span><b>${val}</b></div>`;
+      })
       .join("");
     tip.hidden = false;
-    tip.innerHTML = `<div>${esc(labels[idx])}</div>${rows}`;
-    const left = Math.min(svgBox.clientWidth - 170, Math.max(8, ev.clientX - svgBox.getBoundingClientRect().left + 12));
+    tip.innerHTML = `<div class="chart-tip__date">${esc(fmtLongDate(dates[idx]))}</div>${valueRows}`;
+    const box = svgBox.getBoundingClientRect();
+    const left = Math.min(box.width - 220, Math.max(8, ev.clientX - box.left + 14));
     tip.style.left = `${left}px`;
-    tip.style.top = `12px`;
+    tip.style.top = `28px`;
   };
   svgBox.onmousemove = hover;
   svgBox.onmouseleave = () => {
@@ -1211,6 +1195,7 @@ async function loadProducts() {
     state.chartData = await chartRes.json();
     state.chartOn = new Set([TOTAL_CHART_ID]);
     state.page = 1;
+    renderChartMetricsItems();
     render();
     renderChart();
   } catch (err) {
@@ -1414,27 +1399,11 @@ $("colsItems").addEventListener("change", (e) => {
   else renderMetricHead();
 });
 
-$("chartMetricsBtn").addEventListener("click", (e) => {
-  e.stopPropagation();
-  if (!$("chartMetricsPop").hidden) {
-    closeAllPops();
-    return;
-  }
-  closeAllPops();
-  renderChartMetricsItems();
-  $("chartMetricsPop").hidden = false;
-  $("chartMetricsWrap").classList.add("open");
-});
-$("chartMetricsPop").addEventListener("click", (e) => e.stopPropagation());
 $("chartMetricsItems").addEventListener("change", (e) => {
   const t = e.target;
   if (!t.matches("input[data-chart-metric]")) return;
-  state.chartMetrics[t.dataset.chartMetric] = t.checked;
-  if (!CHART_METRICS.some((c) => state.chartMetrics[c.id])) {
-    state.chartMetrics.expense = true;
-    renderChartMetricsItems();
-  }
-  saveChartMetrics();
+  state.chartMetric = t.dataset.chartMetric;
+  saveChartMetric();
   renderChart();
 });
 
