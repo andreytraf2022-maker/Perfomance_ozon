@@ -922,9 +922,8 @@ function renderChart() {
     if (!svg || n <= 0) return;
     const rect = svg.getBoundingClientRect();
     const scaleX = w / rect.width;
-    const scaleY = h / rect.height;
     const x = (ev.clientX - rect.left) * scaleX;
-    const y = (ev.clientY - rect.top) * scaleY;
+    const y = (ev.clientY - rect.top) * (h / rect.height);
     let idx = 0;
     let best = Infinity;
     for (let i = 0; i < n; i += 1) {
