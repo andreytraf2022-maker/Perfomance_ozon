@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import csv
 import io
 import os
 import re
@@ -11,6 +10,7 @@ from decimal import Decimal
 from functools import lru_cache
 from urllib.parse import quote
 
+import xlwt
 from flask import Flask, Response, jsonify, request, send_from_directory
 
 import demo
@@ -921,26 +921,27 @@ EXPORT_HEADERS = [
 ]
 
 
-def _csv_num(v, nd=2):
-    if v is None:
-        return ""
-    n = float(v)
-    if nd == 0:
-        return str(int(round(n)))
-    s = f"{n:.{nd}f}".rstrip("0").rstrip(".")
-    return s.replace(".", ",")
-
-
-def _csv_date(v):
+def _xls_date(v):
     if not v:
-        return ""
-    if hasattr(v, "strftime"):
-        return v.strftime("%d.%m.%Y")
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
     s = str(v)[:10]
     try:
-        return datetime.strptime(s, "%Y-%m-%d").strftime("%d.%m.%Y")
+        return datetime.strptime(s, "%Y-%m-%d").date()
     except ValueError:
-        return s
+        return None
+
+
+def _xls_num(v, nd=2):
+    if v is None:
+        return None
+    n = float(v)
+    if nd == 0:
+        return int(round(n))
+    return round(n, nd)
 
 
 def _export_line(kind, day, meta, metrics, camp=None):
@@ -956,7 +957,7 @@ def _export_line(kind, day, meta, metrics, camp=None):
     cpc = unit_price(expense, clicks)
     camp = camp or {}
     return [
-        _csv_date(day),
+        _xls_date(day),
         kind,
         meta.get("sku") or "",
         meta.get("artic") or "",
@@ -968,20 +969,20 @@ def _export_line(kind, day, meta, metrics, camp=None):
         camp.get("status") or "",
         camp.get("strategy") or "",
         camp.get("placement") or "",
-        _csv_num(metrics.get("budget")),
-        _csv_num(gmv_n),
-        _csv_num(sales),
-        _csv_num(expense),
-        "" if drr is None else _csv_num(drr, 1),
-        "" if general_drr is None else _csv_num(general_drr, 1),
-        _csv_num(views, 0),
-        _csv_num(clicks, 0),
-        "" if cpc is None else _csv_num(cpc),
-        "" if ctr is None else _csv_num(ctr, 1),
-        _csv_num(metrics.get("to_cart"), 0),
-        _csv_num(metrics.get("model_orders"), 0),
-        _csv_num(metrics.get("model_sales")),
-        _csv_date(meta.get("date_added") if kind == "Товар" else camp.get("date_added")),
+        _xls_num(metrics.get("budget")),
+        _xls_num(gmv_n),
+        _xls_num(sales),
+        _xls_num(expense),
+        None if drr is None else _xls_num(drr, 1),
+        None if general_drr is None else _xls_num(general_drr, 1),
+        _xls_num(views, 0),
+        _xls_num(clicks, 0),
+        None if cpc is None else _xls_num(cpc),
+        None if ctr is None else _xls_num(ctr, 1),
+        _xls_num(metrics.get("to_cart"), 0),
+        _xls_num(metrics.get("model_orders"), 0),
+        _xls_num(metrics.get("model_sales")),
+        _xls_date(meta.get("date_added") if kind == "Товар" else camp.get("date_added")),
     ]
 
 
@@ -1041,13 +1042,53 @@ def pack_export_rows(raw):
     return rows
 
 
-def export_csv_bytes(headers, rows):
-    buf = io.StringIO()
-    buf.write("\ufeff")
-    writer = csv.writer(buf, delimiter=";", lineterminator="\n")
-    writer.writerow(headers)
-    writer.writerows(rows)
-    return buf.getvalue().encode("utf-8")
+def export_xls_bytes(headers, rows):
+    book = xlwt.Workbook(encoding="utf-8")
+    font_head = xlwt.Font()
+    font_head.bold = True
+    head = xlwt.XFStyle()
+    head.font = font_head
+    date_style = xlwt.XFStyle()
+    date_style.num_format_str = "DD.MM.YYYY"
+    money = xlwt.XFStyle()
+    money.num_format_str = "#,##0.00"
+    pct = xlwt.XFStyle()
+    pct.num_format_str = "0.0"
+    integer = xlwt.XFStyle()
+    integer.num_format_str = "#,##0"
+    date_cols = {0, 25}
+    money_cols = {12, 13, 14, 15, 20, 24}
+    pct_cols = {16, 17, 21}
+    int_cols = {18, 19, 22, 23}
+    max_rows = 65535
+    chunks = [rows[i : i + max_rows] for i in range(0, len(rows), max_rows)] or [[]]
+    for sheet_i, chunk in enumerate(chunks):
+        title = "Отчёт" if sheet_i == 0 else f"Отчёт{sheet_i + 1}"
+        sheet = book.add_sheet(title)
+        for col, title_cell in enumerate(headers):
+            sheet.write(0, col, title_cell, head)
+            sheet.col(col).width = 256 * (16 if col not in {5, 8} else 36)
+        for r, row in enumerate(chunk, 1):
+            for c, val in enumerate(row):
+                if val is None or val == "":
+                    continue
+                if c in date_cols and isinstance(val, date):
+                    if not isinstance(val, datetime):
+                        val = datetime(val.year, val.month, val.day)
+                    sheet.write(r, c, val, date_style)
+                elif c in money_cols and isinstance(val, (int, float)):
+                    sheet.write(r, c, float(val), money)
+                elif c in pct_cols and isinstance(val, (int, float)):
+                    sheet.write(r, c, float(val), pct)
+                elif c in int_cols and isinstance(val, (int, float)):
+                    sheet.write(r, c, int(val), integer)
+                else:
+                    sheet.write(r, c, val)
+        sheet.panes_frozen = True
+        sheet.horz_split_pos = 1
+    buf = io.BytesIO()
+    book.save(buf)
+    return buf.getvalue()
 
 
 @app.post("/api/export")
@@ -1101,11 +1142,11 @@ def api_export():
                 cur.execute(sql, [*ctx["params"], *status_list])
                 raw = rows_dicts(cur)
             rows = pack_export_rows(raw)
-    filename = f"ozon-performance_{date_from.isoformat()}_{date_to.isoformat()}.csv"
-    payload = export_csv_bytes(EXPORT_HEADERS, rows)
+    filename = f"ozon-performance_{date_from.isoformat()}_{date_to.isoformat()}.xls"
+    payload = export_xls_bytes(EXPORT_HEADERS, rows)
     return Response(
         payload,
-        mimetype="text/csv; charset=utf-8",
+        mimetype="application/vnd.ms-excel",
         headers={
             "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
             "X-Export-Rows": str(len(rows)),

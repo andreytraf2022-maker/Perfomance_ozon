@@ -1692,7 +1692,7 @@ async function downloadExport() {
     const blob = await res.blob();
     const name = filenameFromDisposition(
       res.headers.get("Content-Disposition"),
-      `ozon-performance_${from}_${to}.csv`
+      `ozon-performance_${from}_${to}.xls`
     );
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
