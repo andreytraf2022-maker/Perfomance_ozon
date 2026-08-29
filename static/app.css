@@ -1093,7 +1093,7 @@ a.camp-id:hover {
   position: absolute;
   z-index: 5;
   pointer-events: none;
-  min-width: 200px;
+  min-width: 260px;
   padding: 12px 14px;
   background: #2b2f36;
   color: #fff;
@@ -1109,13 +1109,34 @@ a.camp-id:hover {
 }
 
 .chart-tip__row {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px 14px;
+  align-items: baseline;
   color: #d1d5db;
 }
 
-.chart-tip__row b { color: #fff; font-weight: 700; }
+.chart-tip__row + .chart-tip__row { margin-top: 4px; }
+
+.chart-tip__row b {
+  color: #fff;
+  font-weight: 700;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-tip__delta {
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  min-width: 4.4em;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.chart-tip__delta.is-up { color: #34d399; }
+.chart-tip__delta.is-down { color: #f87171; }
+.chart-tip__delta.is-flat,
+.chart-tip__delta.is-na { color: #9ca3af; }
 
 .chart-legend {
   display: flex;

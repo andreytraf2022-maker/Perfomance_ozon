@@ -795,6 +795,25 @@ function fmtChartVal(col, v) {
   return int(v);
 }
 
+function deltaPct(curr, prev) {
+  const a = Number(curr);
+  const b = Number(prev);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return null;
+  if (b === 0) return a === 0 ? 0 : null;
+  return ((a - b) / Math.abs(b)) * 100;
+}
+
+function fmtDeltaHtml(pct) {
+  if (pct === null || pct === undefined || !Number.isFinite(pct)) {
+    return `<span class="chart-tip__delta is-na">—</span>`;
+  }
+  const rounded = Math.round(pct * 10) / 10;
+  const cls = rounded > 0 ? "is-up" : rounded < 0 ? "is-down" : "is-flat";
+  const sign = rounded > 0 ? "+" : "";
+  const text = `${sign}${rounded.toLocaleString("ru-RU", { maximumFractionDigits: 1 })}%`;
+  return `<span class="chart-tip__delta ${cls}">${text}</span>`;
+}
+
 function fmtLongDate(s) {
   if (!s) return "";
   const d = parseYmd(s);
@@ -1032,14 +1051,20 @@ function renderChart() {
       .join("");
     const valueRows = series
       .map((s) => {
-        const val = fmtChartVal(s.metric, s.points[idx]?.value);
-        return `<div class="chart-tip__row"><span>${esc(tipTitle(s, metrics, entityCount))}</span><b>${val}</b></div>`;
+        const curr = s.points[idx]?.value;
+        const prev = idx > 0 ? s.points[idx - 1]?.value : null;
+        const val = fmtChartVal(s.metric, curr);
+        return `<div class="chart-tip__row">
+          <span>${esc(tipTitle(s, metrics, entityCount))}</span>
+          <b>${val}</b>
+          ${fmtDeltaHtml(deltaPct(curr, prev))}
+        </div>`;
       })
       .join("");
     tip.hidden = false;
     tip.innerHTML = `<div class="chart-tip__date">${esc(fmtLongDate(dates[idx]))}</div>${valueRows}`;
     const box = svgBox.getBoundingClientRect();
-    const left = Math.min(box.width - 240, Math.max(8, ev.clientX - box.left + 14));
+    const left = Math.min(box.width - 280, Math.max(8, ev.clientX - box.left + 14));
     tip.style.left = `${left}px`;
     tip.style.top = `28px`;
   };
