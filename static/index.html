@@ -5,11 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>OZON Performance — товары</title>
   <link rel="icon" type="image/png" href="/static/favicon.png">
-  <link rel="stylesheet" href="/static/app.css?v=11">
+  <link rel="stylesheet" href="/static/app.css?v=22">
 </head>
 <body>
   <header class="top">
     <div class="top__title">Аналитика продвижения</div>
+    <div class="demo-banner" id="demoBanner" hidden>
+      Демо-режим: SQL Server недоступен, показаны учебные данные
+    </div>
   </header>
 
   <section class="filters">
@@ -261,11 +264,42 @@
         <button type="button" class="btn" id="apply">Показать</button>
         <span class="spinner" id="spinner" hidden></span>
         <button type="button" class="btn btn--ghost" id="reset">Сбросить</button>
+        <button type="button" class="btn btn--ghost" id="exportBtn">Скачать</button>
       </div>
     </div>
   </section>
 
   <div id="hint" class="status" hidden></div>
+
+  <section class="chart-card" id="chartCard" hidden>
+    <div class="chart-layout">
+      <aside class="chart-metrics">
+        <div class="chart-metrics__title">Показатели</div>
+        <p class="chart-metrics__hint">Вместе: «Всего заказано», «Заказано по рек.», «Расход» и «Модельные продажи»</p>
+        <div class="chart-metrics__list" id="chartMetricsItems"></div>
+      </aside>
+      <div class="chart-main">
+        <div class="chart-card__head">
+          <div class="chart-card__title">График</div>
+          <div class="chart-card__tools">
+            <button type="button" class="chart-link" id="chartExpand">Развернуть график</button>
+            <div class="chart-grain" id="chartGrain">
+              <button type="button" class="is-on" data-grain="day">День</button>
+              <button type="button" data-grain="week">Неделя</button>
+            </div>
+          </div>
+        </div>
+        <div class="chart-card__plot" id="chartPlot">
+          <div class="chart-y" id="chartYLabel">Расход, ₽</div>
+          <div class="chart-y chart-y--right" id="chartYLabelRight" hidden></div>
+          <div class="chart-svg" id="chartSvg"></div>
+          <div class="chart-tip" id="chartTip" hidden></div>
+        </div>
+        <div class="chart-legend" id="chartLegend"></div>
+        <div class="chart-empty" id="chartEmpty" hidden>Включите глазик у «Итого», товара или кампании</div>
+      </div>
+    </div>
+  </section>
 
   <div class="table-shell">
     <div class="table-toolbar">
@@ -322,6 +356,37 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=11"></script>
+  <div class="dlg" id="exportDlg" hidden>
+    <div class="dlg__backdrop" id="exportDlgBackdrop"></div>
+    <div class="dlg__card" role="dialog" aria-modal="true" aria-labelledby="exportDlgTitle">
+      <div class="dlg__head">
+        <h2 id="exportDlgTitle">Скачать отчёт</h2>
+        <button type="button" class="dlg__x" id="exportDlgClose" aria-label="Закрыть">×</button>
+      </div>
+      <p class="dlg__lead">Выберите период. Файл Excel (.xlsx): одна строка на кампанию, суммы за весь период, все показатели. Остальные фильтры кабинета сохраняются.</p>
+      <div class="field">
+        <span>Период</span>
+        <div class="export-dates">
+          <input type="date" id="exportFrom">
+          <span class="export-dates__sep">—</span>
+          <input type="date" id="exportTo">
+        </div>
+      </div>
+      <div class="export-presets" id="exportPresets">
+        <button type="button" data-export-preset="today">Сегодня</button>
+        <button type="button" data-export-preset="yesterday">Вчера</button>
+        <button type="button" data-export-preset="7d">За 7 дней</button>
+        <button type="button" data-export-preset="month">Текущий месяц</button>
+        <button type="button" data-export-preset="prev-month">Прошедший месяц</button>
+      </div>
+      <div class="dlg__err" id="exportDlgErr" hidden></div>
+      <div class="dlg__actions">
+        <button type="button" class="btn btn--ghost" id="exportDlgCancel">Отмена</button>
+        <button type="button" class="btn" id="exportDlgGo">Скачать</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=22"></script>
 </body>
 </html>

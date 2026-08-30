@@ -1,2 +1,4 @@
-flask
-pyodbc
+flask>=3.0.0
+xlsxwriter>=3.2.0
+# Для продакшена с SQL Server: pip install pyodbc
+# и ODBC Driver 17 for SQL Server

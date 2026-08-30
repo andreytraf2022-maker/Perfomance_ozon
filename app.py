@@ -1,28 +1,60 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import io
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from functools import lru_cache
+from urllib.parse import quote
 
-import pyodbc
-from flask import Flask, jsonify, request, send_from_directory
+import xlsxwriter
+from flask import Flask, Response, jsonify, request, send_from_directory
+
+import demo
+
+try:
+    import pyodbc
+except ImportError:  # pragma: no cover - локальный запуск без ODBC
+    pyodbc = None
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONN_STR = (
-    "DRIVER={ODBC Driver 17 for SQL Server};"
-    "SERVER=prdsql;"
-    "DATABASE=mag_pbi;"
-    "Trusted_Connection=yes;"
-    "TrustServerCertificate=yes;"
+CONN_STR = os.environ.get(
+    "OZON_SQL_CONN",
+    (
+        "DRIVER={ODBC Driver 17 for SQL Server};"
+        "SERVER=prdsql;"
+        "DATABASE=mag_pbi;"
+        "Trusted_Connection=yes;"
+        "TrustServerCertificate=yes;"
+    ),
 )
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 
 
+def _env_flag(name):
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+@lru_cache(maxsize=1)
+def demo_mode():
+    if _env_flag("OZON_DEMO"):
+        return True
+    if pyodbc is None:
+        return True
+    try:
+        with connect() as conn:
+            conn.cursor().execute("SELECT 1")
+        return False
+    except Exception:
+        return True
+
+
 def connect():
+    if pyodbc is None:
+        raise RuntimeError("pyodbc не установлен")
     conn = pyodbc.connect(CONN_STR, timeout=20)
     conn.timeout = 90
     return conn
@@ -135,120 +167,18 @@ def req_list(name):
     return split_list(vals)
 
 
-def add_str_filter(expr, values, extra, extra_params, exact=False):
-    values = _uniq(values)
-    if not values:
-        return
-    if exact or len(values) > 1:
-        ph = ",".join("?" * len(values))
-        extra.append(f"{expr} IN ({ph})")
-        extra_params.extend(values)
-    else:
-        extra.append(f"{expr} LIKE ?")
-        extra_params.append(f"%{values[0]}%")
+def each_day(start, end):
+    if not start or not end:
+        return []
+    days = []
+    cur = start
+    while cur <= end:
+        days.append(cur)
+        cur += timedelta(days=1)
+    return days
 
 
-@lru_cache(maxsize=1)
-def date_bounds():
-    with connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT MIN(report_date), MAX(report_date) FROM ext_belousov.ozon_perfomance"
-        )
-        mn, mx = cur.fetchone()
-        return mn, mx
-
-
-@app.get("/")
-def index():
-    return send_from_directory(APP_DIR, "static/index.html")
-
-
-@app.get("/api/meta")
-def api_meta():
-    mn, mx = date_bounds()
-    with connect() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT DISTINCT LTRIM(RTRIM(g.g)) AS g
-            FROM pbi.groups g
-            WHERE NULLIF(LTRIM(RTRIM(g.g)), '') IS NOT NULL
-              AND g.g NOT LIKE N'%*%'
-            ORDER BY 1
-            """
-        )
-        groups1 = [r[0] for r in cur.fetchall()]
-        cur.execute(
-            """
-            SELECT DISTINCT LTRIM(RTRIM(n.[Менеджер OZON])) AS mgr
-            FROM pbi.nomenclature AS n
-            WHERE NULLIF(LTRIM(RTRIM(n.[Менеджер OZON])), N'') IS NOT NULL
-            ORDER BY 1
-            """
-        )
-        managers = [r[0] for r in cur.fetchall()]
-    managers = ["Без менеджера", *managers]
-    return jsonify(
-        {
-            "min_date": mn.isoformat() if mn else None,
-            "max_date": mx.isoformat() if mx else None,
-            "groups1": groups1,
-            "managers": managers,
-        }
-    )
-
-
-def _args_list(name):
-    if request.is_json:
-        body = request.get_json(silent=True) or {}
-        if name in body:
-            return split_list(body.get(name))
-    return split_list(request.args.getlist(name) or request.args.get(name))
-
-
-@app.get("/api/groups")
-@app.post("/api/groups")
-def api_groups():
-    gs = _args_list("g")
-    g1s = _args_list("g1")
-    if not gs:
-        return jsonify([])
-    with connect() as conn:
-        cur = conn.cursor()
-        g_ph = ",".join("?" * len(gs))
-        if not g1s:
-            cur.execute(
-                f"""
-                SELECT DISTINCT LTRIM(RTRIM(g1)) AS val
-                FROM pbi.groups
-                WHERE LTRIM(RTRIM(g)) IN ({g_ph})
-                  AND NULLIF(LTRIM(RTRIM(g1)), '') IS NOT NULL
-                  AND g NOT LIKE N'%*%'
-                ORDER BY 1
-                """,
-                gs,
-            )
-        else:
-            g1_ph = ",".join("?" * len(g1s))
-            cur.execute(
-                f"""
-                SELECT DISTINCT LTRIM(RTRIM(g2)) AS val
-                FROM pbi.groups
-                WHERE LTRIM(RTRIM(g)) IN ({g_ph})
-                  AND LTRIM(RTRIM(g1)) IN ({g1_ph})
-                  AND NULLIF(LTRIM(RTRIM(g2)), '') IS NOT NULL
-                  AND g NOT LIKE N'%*%'
-                ORDER BY 1
-                """,
-                [*gs, *g1s],
-            )
-        return jsonify([r[0] for r in cur.fetchall()])
-
-
-@app.get("/api/products")
-@app.post("/api/products")
-def api_products():
+def parse_report_request():
     mn, mx = date_bounds()
     raw_from = req_val("from")
     raw_to = req_val("to")
@@ -269,9 +199,6 @@ def api_products():
     skus = req_list("sku")
     campaign_ids = req_list("campaign_id")
     body = request.get_json(silent=True) or {}
-    artic_exact = True
-    code_exact = True
-    nom_exact = True
     if request.is_json and "statuses" in body:
         statuses = split_list(body.get("statuses"))
     elif request.args.getlist("statuses"):
@@ -297,22 +224,36 @@ def api_products():
         extra.append("NULLIF(LTRIM(RTRIM(n.manager)), N'') IS NULL")
     else:
         add_str_filter("LTRIM(RTRIM(n.manager))", named_managers, extra, extra_params, exact=True)
-    add_str_filter("n.artic", artic, extra, extra_params, exact=artic_exact)
-    add_str_filter("n.code", code, extra, extra_params, exact=code_exact)
+    add_str_filter("n.artic", artic, extra, extra_params, exact=True)
+    add_str_filter("n.code", code, extra, extra_params, exact=True)
     add_str_filter(
         "COALESCE(n.description, a.nom_tbl, a.product_name)",
         nom,
         extra,
         extra_params,
-        exact=nom_exact,
+        exact=True,
     )
     add_str_filter("a.sku", skus, extra, extra_params, exact=True)
     add_str_filter("a.campaign_id", campaign_ids, extra, extra_params, exact=True)
-
     extra_sql = (" AND " + " AND ".join(extra)) if extra else ""
-    params: list = [date_from, date_to, *extra_params]
+    return {
+        "date_from": date_from,
+        "date_to": date_to,
+        "extra_sql": extra_sql,
+        "params": [date_from, date_to, *extra_params],
+        "status_set": status_set,
+        "filters": {
+            "statuses": list(status_set),
+            "artic": artic,
+            "code": code,
+            "nom": nom,
+            "sku": skus,
+            "campaign_id": campaign_ids,
+        },
+    }
 
-    sql = f"""
+
+SRC_CTE = """
     WITH ads AS (
         SELECT
             LTRIM(RTRIM(t.sku)) AS sku,
@@ -379,6 +320,160 @@ def api_products():
         LEFT JOIN pbi.groups AS gr ON gr.[1c_id] = n.[1c_group]
         WHERE 1 = 1{extra_sql}
     ),
+    camp_status AS (
+        SELECT sku, campaign_id, status, strategy, placement
+        FROM (
+            SELECT
+                sku,
+                campaign_id,
+                status,
+                strategy,
+                placement,
+                ROW_NUMBER() OVER (
+                    PARTITION BY sku, campaign_id
+                    ORDER BY
+                        CASE WHEN status IS NULL OR LTRIM(RTRIM(status)) = N'' THEN 1 ELSE 0 END,
+                        report_date DESC
+                ) AS rn
+            FROM src
+        ) x
+        WHERE rn = 1
+    )
+"""
+
+
+def add_str_filter(expr, values, extra, extra_params, exact=False):
+    values = _uniq(values)
+    if not values:
+        return
+    if exact or len(values) > 1:
+        ph = ",".join("?" * len(values))
+        extra.append(f"{expr} IN ({ph})")
+        extra_params.extend(values)
+    else:
+        extra.append(f"{expr} LIKE ?")
+        extra_params.append(f"%{values[0]}%")
+
+
+@lru_cache(maxsize=1)
+def date_bounds():
+    if demo_mode():
+        return demo.MIN_DATE, demo.MAX_DATE
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT MIN(report_date), MAX(report_date) FROM ext_belousov.ozon_perfomance"
+        )
+        mn, mx = cur.fetchone()
+        return mn, mx
+
+
+@app.get("/")
+def index():
+    return send_from_directory(APP_DIR, "static/index.html")
+
+
+@app.get("/api/meta")
+def api_meta():
+    if demo_mode():
+        return jsonify(demo.meta())
+    mn, mx = date_bounds()
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT DISTINCT LTRIM(RTRIM(g.g)) AS g
+            FROM pbi.groups g
+            WHERE NULLIF(LTRIM(RTRIM(g.g)), '') IS NOT NULL
+              AND g.g NOT LIKE N'%*%'
+            ORDER BY 1
+            """
+        )
+        groups1 = [r[0] for r in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT DISTINCT LTRIM(RTRIM(n.[Менеджер OZON])) AS mgr
+            FROM pbi.nomenclature AS n
+            WHERE NULLIF(LTRIM(RTRIM(n.[Менеджер OZON])), N'') IS NOT NULL
+            ORDER BY 1
+            """
+        )
+        managers = [r[0] for r in cur.fetchall()]
+    managers = ["Без менеджера", *managers]
+    return jsonify(
+        {
+            "demo": False,
+            "min_date": mn.isoformat() if mn else None,
+            "max_date": mx.isoformat() if mx else None,
+            "groups1": groups1,
+            "managers": managers,
+        }
+    )
+
+
+def _args_list(name):
+    if request.is_json:
+        body = request.get_json(silent=True) or {}
+        if name in body:
+            return split_list(body.get(name))
+    return split_list(request.args.getlist(name) or request.args.get(name))
+
+
+@app.get("/api/groups")
+@app.post("/api/groups")
+def api_groups():
+    gs = _args_list("g")
+    g1s = _args_list("g1")
+    if not gs:
+        return jsonify([])
+    if demo_mode():
+        return jsonify(demo.groups(gs, g1s))
+    with connect() as conn:
+        cur = conn.cursor()
+        g_ph = ",".join("?" * len(gs))
+        if not g1s:
+            cur.execute(
+                f"""
+                SELECT DISTINCT LTRIM(RTRIM(g1)) AS val
+                FROM pbi.groups
+                WHERE LTRIM(RTRIM(g)) IN ({g_ph})
+                  AND NULLIF(LTRIM(RTRIM(g1)), '') IS NOT NULL
+                  AND g NOT LIKE N'%*%'
+                ORDER BY 1
+                """,
+                gs,
+            )
+        else:
+            g1_ph = ",".join("?" * len(g1s))
+            cur.execute(
+                f"""
+                SELECT DISTINCT LTRIM(RTRIM(g2)) AS val
+                FROM pbi.groups
+                WHERE LTRIM(RTRIM(g)) IN ({g_ph})
+                  AND LTRIM(RTRIM(g1)) IN ({g1_ph})
+                  AND NULLIF(LTRIM(RTRIM(g2)), '') IS NOT NULL
+                  AND g NOT LIKE N'%*%'
+                ORDER BY 1
+                """,
+                [*gs, *g1s],
+            )
+        return jsonify([r[0] for r in cur.fetchall()])
+
+
+@app.get("/api/products")
+@app.post("/api/products")
+def api_products():
+    ctx = parse_report_request()
+    date_from = ctx["date_from"]
+    date_to = ctx["date_to"]
+    extra_sql = ctx["extra_sql"]
+    params = ctx["params"]
+    status_set = ctx["status_set"]
+
+    if demo_mode():
+        return jsonify(demo.products(date_from, date_to, ctx["filters"]))
+
+    sql = SRC_CTE.format(extra_sql=extra_sql).rstrip() + """,
     sku_gmv AS (
         SELECT sku, SUM(day_gmv) AS gmv
         FROM (
@@ -418,25 +513,6 @@ def api_products():
             MIN(date_added) AS date_added
         FROM src
         GROUP BY sku, campaign_id
-    ),
-    camp_status AS (
-        SELECT sku, campaign_id, status, strategy, placement
-        FROM (
-            SELECT
-                sku,
-                campaign_id,
-                status,
-                strategy,
-                placement,
-                ROW_NUMBER() OVER (
-                    PARTITION BY sku, campaign_id
-                    ORDER BY
-                        CASE WHEN status IS NULL OR LTRIM(RTRIM(status)) = N'' THEN 1 ELSE 0 END,
-                        report_date DESC
-                ) AS rn
-            FROM src
-        ) x
-        WHERE rn = 1
     )
     SELECT
         a.sku,
@@ -617,6 +693,460 @@ def api_products():
     )
 
 
+def empty_chart(date_from, date_to, demo=False):
+    days = each_day(date_from, date_to)
+    blank = _metrics_from_acc({})
+    return {
+        "demo": demo,
+        "from": date_from.isoformat() if date_from else None,
+        "to": date_to.isoformat() if date_to else None,
+        "series": [
+            {
+                "id": "total",
+                "kind": "total",
+                "name": "Итого",
+                "points": [{"date": d.isoformat(), **blank} for d in days],
+            }
+        ],
+    }
+
+
+def _metrics_from_acc(acc):
+    sales = num(acc.get("sales"))
+    expense = num(acc.get("expense"))
+    views = num(acc.get("views"))
+    clicks = num(acc.get("clicks"))
+    gmv = num(acc.get("gmv"))
+    return {
+        "sales": round(sales, 2),
+        "expense": round(expense, 2),
+        "views": int(views),
+        "clicks": int(clicks),
+        "to_cart": int(num(acc.get("to_cart"))),
+        "model_orders": int(num(acc.get("model_orders"))),
+        "model_sales": round(num(acc.get("model_sales")), 2),
+        "budget": round(num(acc.get("budget")), 2),
+        "gmv": round(gmv, 2),
+        "drr": ratio(expense, sales),
+        "general_drr": ratio(expense, gmv),
+        "ctr": ratio(clicks, views),
+        "cpc": unit_price(expense, clicks),
+    }
+
+
+def _add_into(dst, src, gmv="sum"):
+    for key in (
+        "sales",
+        "expense",
+        "views",
+        "clicks",
+        "to_cart",
+        "model_orders",
+        "model_sales",
+        "budget",
+    ):
+        dst[key] = num(dst.get(key)) + num(src.get(key))
+    if gmv == "max":
+        dst["gmv"] = max(num(dst.get("gmv")), num(src.get("gmv")))
+    else:
+        dst["gmv"] = num(dst.get("gmv")) + num(src.get("gmv"))
+
+
+def _points_from_days(days, by_date):
+    out = []
+    for d in days:
+        out.append({"date": d.isoformat(), **_metrics_from_acc(by_date.get(d.isoformat()) or {})})
+    return out
+
+
+def pack_chart_series(date_from, date_to, rows):
+    days = each_day(date_from, date_to)
+    camps: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        sku = str(row.get("sku") or "").strip()
+        camp_id = str(row.get("campaign_id") or "").strip()
+        if not sku or not camp_id:
+            continue
+        day = row["report_date"]
+        day_s = day.isoformat()[:10] if hasattr(day, "isoformat") else str(day)[:10]
+        item = camps.setdefault(
+            (sku, camp_id),
+            {
+                "sku": sku,
+                "campaign_id": camp_id,
+                "name": row.get("campaign_name") or camp_id,
+                "nom_name": row.get("nom_name") or sku,
+                "vals": {},
+            },
+        )
+        if row.get("campaign_name"):
+            item["name"] = row["campaign_name"]
+        if row.get("nom_name"):
+            item["nom_name"] = row["nom_name"]
+        acc = item["vals"].setdefault(day_s, {})
+        _add_into(acc, row, gmv="max")
+
+    sku_days: dict[str, dict] = {}
+    sku_names: dict[str, str] = {}
+    for (sku, camp_id), item in camps.items():
+        sku_names[sku] = item["nom_name"]
+        by_day = sku_days.setdefault(sku, {})
+        for day_s, acc in item["vals"].items():
+            dst = by_day.setdefault(day_s, {})
+            _add_into(dst, acc, gmv="max")
+
+    total_days: dict[str, dict] = {}
+    for by_day in sku_days.values():
+        for day_s, acc in by_day.items():
+            dst = total_days.setdefault(day_s, {})
+            _add_into(dst, acc, gmv="sum")
+
+    series = [
+        {
+            "id": "total",
+            "kind": "total",
+            "name": "Итого",
+            "points": _points_from_days(days, total_days),
+        }
+    ]
+    sku_ranked = sorted(
+        sku_days.items(),
+        key=lambda kv: -sum(num(acc.get("expense")) for acc in kv[1].values()),
+    )
+    for sku, by_day in sku_ranked:
+        series.append(
+            {
+                "id": sku,
+                "kind": "sku",
+                "name": sku_names.get(sku) or sku,
+                "points": _points_from_days(days, by_day),
+            }
+        )
+    camp_ranked = sorted(
+        camps.values(),
+        key=lambda item: -sum(num(acc.get("expense")) for acc in item["vals"].values()),
+    )
+    for item in camp_ranked:
+        series.append(
+            {
+                "id": f"camp:{item['sku']}:{item['campaign_id']}",
+                "kind": "campaign",
+                "name": item["name"],
+                "points": _points_from_days(days, item["vals"]),
+            }
+        )
+    return series
+
+
+@app.get("/api/chart")
+@app.post("/api/chart")
+def api_chart():
+    ctx = parse_report_request()
+    date_from = ctx["date_from"]
+    date_to = ctx["date_to"]
+    if demo_mode():
+        return jsonify(demo.chart(date_from, date_to, ctx["filters"]))
+
+    status_set = ctx["status_set"]
+    if not date_from or not date_to or not status_set:
+        return jsonify(empty_chart(date_from, date_to))
+
+    status_list = list(status_set)
+    status_ph = ",".join("?" * len(status_list))
+    sql = SRC_CTE.format(extra_sql=ctx["extra_sql"]).rstrip() + f"""
+    SELECT
+        s.sku,
+        s.campaign_id,
+        MAX(s.campaign_name) AS campaign_name,
+        MAX(s.nom_name) AS nom_name,
+        CAST(s.report_date AS date) AS report_date,
+        SUM(s.sales) AS sales,
+        SUM(s.expense) AS expense,
+        SUM(s.views) AS views,
+        SUM(s.clicks) AS clicks,
+        SUM(s.to_cart) AS to_cart,
+        SUM(s.model_orders) AS model_orders,
+        SUM(s.model_sales) AS model_sales,
+        MAX(s.weekly_budget) AS budget,
+        MAX(s.product_gmv) AS gmv
+    FROM src AS s
+    INNER JOIN camp_status AS cs
+        ON cs.sku = s.sku AND cs.campaign_id = s.campaign_id
+    WHERE LTRIM(RTRIM(ISNULL(cs.status, N''))) IN ({status_ph})
+    GROUP BY s.sku, s.campaign_id, CAST(s.report_date AS date)
+    ORDER BY s.sku, s.campaign_id, CAST(s.report_date AS date);
+    """
+    with connect() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, [*ctx["params"], *status_list])
+        raw = rows_dicts(cur)
+    return jsonify(
+        {
+            "demo": False,
+            "from": date_from.isoformat(),
+            "to": date_to.isoformat(),
+            "series": pack_chart_series(date_from, date_to, raw),
+        }
+    )
+
+
+EXPORT_HEADERS = [
+    "SKU",
+    "Артикул",
+    "Код",
+    "Наименование",
+    "Менеджер",
+    "ID кампании",
+    "Кампания",
+    "Статус",
+    "Стратегия",
+    "Размещение",
+    "Бюджет РК, ₽",
+    "Всего заказано, ₽",
+    "Заказано по рек., ₽",
+    "Расход, ₽",
+    "ДРР по рекл., %",
+    "ДРР общий, %",
+    "Показы",
+    "Клики",
+    "CPC",
+    "CTR",
+    "Добавлено в корзину",
+    "Модельные заказы",
+    "Модельные продажи, ₽",
+    "Дата добавления товара",
+]
+
+
+def _xls_date(v):
+    if not v:
+        return None
+    if isinstance(v, datetime):
+        return v.date()
+    if isinstance(v, date):
+        return v
+    s = str(v)[:10]
+    try:
+        return datetime.strptime(s, "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+def _xls_num(v, nd=2):
+    if v is None:
+        return None
+    n = float(v)
+    if nd == 0:
+        return int(round(n))
+    return round(n, nd)
+
+
+def _add_period(dst, src):
+    for key in ("sales", "expense", "views", "clicks", "to_cart", "model_orders", "model_sales", "gmv"):
+        dst[key] = num(dst.get(key)) + num(src.get(key))
+    dst["budget"] = max(num(dst.get("budget")), num(src.get("budget")))
+
+
+def _export_line(meta, metrics, camp):
+    sales = num(metrics.get("sales"))
+    expense = num(metrics.get("expense"))
+    views = num(metrics.get("views"))
+    clicks = num(metrics.get("clicks"))
+    gmv = metrics.get("gmv")
+    gmv_n = None if gmv is None else num(gmv)
+    drr = ratio(expense, sales)
+    general_drr = ratio(expense, gmv_n)
+    ctr = ratio(clicks, views)
+    cpc = unit_price(expense, clicks)
+    return [
+        meta.get("sku") or "",
+        meta.get("artic") or "",
+        meta.get("code") or "",
+        meta.get("name") or "",
+        meta.get("manager") or "",
+        camp.get("id") or "",
+        camp.get("name") or "",
+        camp.get("status") or "",
+        camp.get("strategy") or "",
+        camp.get("placement") or "",
+        _xls_num(metrics.get("budget")),
+        _xls_num(gmv_n),
+        _xls_num(sales),
+        _xls_num(expense),
+        None if drr is None else _xls_num(drr, 1),
+        None if general_drr is None else _xls_num(general_drr, 1),
+        _xls_num(views, 0),
+        _xls_num(clicks, 0),
+        None if cpc is None else _xls_num(cpc),
+        None if ctr is None else _xls_num(ctr, 1),
+        _xls_num(metrics.get("to_cart"), 0),
+        _xls_num(metrics.get("model_orders"), 0),
+        _xls_num(metrics.get("model_sales")),
+        _xls_date(camp.get("date_added") or meta.get("date_added")),
+    ]
+
+
+def pack_export_rows(raw):
+    camps = {}
+    for row in raw:
+        sku = str(row.get("sku") or "").strip()
+        camp_id = str(row.get("campaign_id") or "").strip()
+        if not sku or not camp_id:
+            continue
+        key = (sku, camp_id)
+        item = camps.get(key)
+        if item is None:
+            item = {
+                "meta": {
+                    "sku": sku,
+                    "name": row.get("nom_name") or sku,
+                    "artic": row.get("artic"),
+                    "code": row.get("code"),
+                    "manager": row.get("manager"),
+                    "date_added": row.get("date_added"),
+                },
+                "camp": {
+                    "id": camp_id,
+                    "name": row.get("campaign_name") or camp_id,
+                    "status": (row.get("status") or "").strip(),
+                    "strategy": (row.get("strategy") or "").strip(),
+                    "placement": (row.get("placement") or "").strip(),
+                    "date_added": row.get("date_added"),
+                },
+                "acc": {
+                    "sales": 0.0,
+                    "expense": 0.0,
+                    "views": 0.0,
+                    "clicks": 0.0,
+                    "to_cart": 0.0,
+                    "model_orders": 0.0,
+                    "model_sales": 0.0,
+                    "budget": 0.0,
+                    "gmv": 0.0,
+                },
+            }
+            camps[key] = item
+        else:
+            if row.get("nom_name"):
+                item["meta"]["name"] = row["nom_name"]
+            if row.get("campaign_name"):
+                item["camp"]["name"] = row["campaign_name"]
+            if row.get("date_added") and not item["camp"].get("date_added"):
+                item["camp"]["date_added"] = row["date_added"]
+        _add_period(item["acc"], row)
+    ordered = sorted(
+        camps.values(),
+        key=lambda it: (-num(it["acc"].get("expense")), it["meta"]["sku"], it["camp"]["id"]),
+    )
+    return [_export_line(it["meta"], it["acc"], it["camp"]) for it in ordered]
+
+
+def export_xlsx_bytes(headers, rows):
+    buf = io.BytesIO()
+    book = xlsxwriter.Workbook(buf, {"in_memory": True, "strings_to_urls": False})
+    sheet = book.add_worksheet("Отчёт")
+    head = book.add_format({"bold": True, "bg_color": "#F3F4F6", "border": 1, "valign": "vcenter"})
+    text = book.add_format({"valign": "vcenter"})
+    money = book.add_format({"num_format": "#,##0.00", "valign": "vcenter"})
+    pct = book.add_format({"num_format": "0.0", "valign": "vcenter"})
+    integer = book.add_format({"num_format": "#,##0", "valign": "vcenter"})
+    date_fmt = book.add_format({"num_format": "DD.MM.YYYY", "valign": "vcenter"})
+    money_cols = {10, 11, 12, 13, 18, 22}
+    pct_cols = {14, 15, 19}
+    int_cols = {16, 17, 20, 21}
+    date_cols = {23}
+    widths = [14, 14, 14, 42, 18, 14, 36, 16, 22, 22, 14, 18, 18, 14, 14, 14, 12, 12, 12, 10, 18, 16, 20, 20]
+    for col, title in enumerate(headers):
+        sheet.write(0, col, title, head)
+        sheet.set_column(col, col, widths[col] if col < len(widths) else 14)
+    for r, row in enumerate(rows, 1):
+        for c, val in enumerate(row):
+            if val is None or val == "":
+                continue
+            if c in date_cols and isinstance(val, date):
+                sheet.write_datetime(r, c, datetime(val.year, val.month, val.day), date_fmt)
+            elif c in money_cols and isinstance(val, (int, float)):
+                sheet.write_number(r, c, float(val), money)
+            elif c in pct_cols and isinstance(val, (int, float)):
+                sheet.write_number(r, c, float(val), pct)
+            elif c in int_cols and isinstance(val, (int, float)):
+                sheet.write_number(r, c, int(val), integer)
+            elif isinstance(val, (int, float)):
+                sheet.write_number(r, c, float(val), text)
+            else:
+                sheet.write(r, c, val, text)
+    sheet.freeze_panes(1, 0)
+    sheet.autofilter(0, 0, max(len(rows), 1), len(headers) - 1)
+    book.close()
+    return buf.getvalue()
+
+
+@app.post("/api/export")
+def api_export():
+    ctx = parse_report_request()
+    date_from = ctx["date_from"]
+    date_to = ctx["date_to"]
+    if not date_from or not date_to:
+        return jsonify({"error": "Укажите период"}), 400
+    if demo_mode():
+        rows = pack_export_rows(demo.export_raw(date_from, date_to, ctx["filters"]))
+    else:
+        status_set = ctx["status_set"]
+        if not status_set:
+            rows = []
+        else:
+            status_list = list(status_set)
+            status_ph = ",".join("?" * len(status_list))
+            sql = SRC_CTE.format(extra_sql=ctx["extra_sql"]).rstrip() + f"""
+    SELECT
+        s.sku,
+        s.campaign_id,
+        MAX(s.campaign_name) AS campaign_name,
+        MAX(s.nom_name) AS nom_name,
+        MAX(s.artic) AS artic,
+        MAX(s.code) AS code,
+        MAX(s.manager) AS manager,
+        MAX(cs.status) AS status,
+        MAX(cs.strategy) AS strategy,
+        MAX(cs.placement) AS placement,
+        SUM(s.sales) AS sales,
+        SUM(s.expense) AS expense,
+        SUM(s.views) AS views,
+        SUM(s.clicks) AS clicks,
+        SUM(s.to_cart) AS to_cart,
+        SUM(s.model_orders) AS model_orders,
+        SUM(s.model_sales) AS model_sales,
+        MAX(s.weekly_budget) AS budget,
+        SUM(s.product_gmv) AS gmv,
+        MIN(s.date_added) AS date_added
+    FROM src AS s
+    INNER JOIN camp_status AS cs
+        ON cs.sku = s.sku AND cs.campaign_id = s.campaign_id
+    WHERE LTRIM(RTRIM(ISNULL(cs.status, N''))) IN ({status_ph})
+    GROUP BY s.sku, s.campaign_id
+    ORDER BY SUM(s.expense) DESC, s.sku, s.campaign_id;
+    """
+            with connect() as conn:
+                cur = conn.cursor()
+                cur.execute(sql, [*ctx["params"], *status_list])
+                raw = rows_dicts(cur)
+            rows = pack_export_rows(raw)
+    filename = f"ozon-performance_{date_from.isoformat()}_{date_to.isoformat()}.xlsx"
+    payload = export_xlsx_bytes(EXPORT_HEADERS, rows)
+    return Response(
+        payload,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(filename)}",
+            "X-Export-Rows": str(len(rows)),
+        },
+    )
+
+
+
 if __name__ == "__main__":
     date_bounds.cache_clear()
-    app.run(host="127.0.0.1", port=8765, debug=False, threaded=True)
+    demo_mode.cache_clear()
+    host = os.environ.get("OZON_HOST", "0.0.0.0")
+    port = int(os.environ.get("OZON_PORT", "8765"))
+    app.run(host=host, port=port, debug=False, threaded=True)
