@@ -147,7 +147,7 @@ const state = {
   pageSize: 50,
   cols: loadCols(),
   sort: { id: "expense", dir: "desc" },
-  chartGrain: "week",
+  chartGrain: "day",
   chartExpanded: false,
   chartOn: new Set([TOTAL_CHART_ID]),
   chartData: null,
